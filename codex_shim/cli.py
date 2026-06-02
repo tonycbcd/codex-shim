@@ -14,6 +14,7 @@ import plistlib
 import struct
 from urllib.request import urlopen
 
+from . import router as router_module
 from .catalog import _toml_escape, codex_config_overrides, write_catalog, write_config
 from .cursor_passthrough import (
     cursor_passthrough_available,
@@ -27,6 +28,7 @@ from .settings import (
     DEFAULT_PORT,
     PROVIDER_NAME,
     ModelSettings,
+    available_model_slugs,
     chatgpt_passthrough_available,
     chatgpt_passthrough_display_names,
     chatgpt_passthrough_slugs,
@@ -159,15 +161,26 @@ def _load_models(settings_path: Path):
         raise SystemExit(f"Settings file is not valid JSON: {expanded}: {exc}") from exc
 
 
+def _active_router(models, settings_path: Path):
+    """RouterConfig when the Auto Router is enabled and has a usable candidate."""
+    config = router_module.load_router_config(Path(settings_path).expanduser())
+    if config and router_module.router_is_active(config, available_model_slugs(models)):
+        return config
+    return None
+
+
 def generate(settings_path: Path, port: int) -> None:
     models = _load_models(settings_path)
     try:
         default_model_slug(models)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    write_catalog(models, CATALOG_PATH)
+    router_config = router_module.load_router_config(Path(settings_path).expanduser())
+    write_catalog(models, CATALOG_PATH, router_config=router_config)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     print(f"Generated {len(models)} model entries:")
+    if _active_router(models, settings_path) is not None:
+        print(f"  auto router: {router_config.slug} ({router_config.display_name})")
     print(f"  catalog: {CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
     print("No files under ~/.codex were modified.")
@@ -175,7 +188,8 @@ def generate(settings_path: Path, port: int) -> None:
 
 def install_codex_config(settings_path: Path, port: int, model_slug: str | None = None) -> None:
     models = _load_models(settings_path)
-    default_slug = _resolve_model_slug(models, model_slug)
+    router_config = _active_router(models, settings_path)
+    default_slug = _resolve_model_slug(models, model_slug, router_config)
     CODEX_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     original = CODEX_CONFIG_PATH.read_text() if CODEX_CONFIG_PATH.exists() else ""
@@ -189,7 +203,7 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
         previous_top_level = _extract_top_level_key_lines(CODEX_CONFIG_BACKUP_PATH.read_text(), MANAGED_TOP_LEVEL_KEYS)
     cleaned = _remove_top_level_keys(cleaned, MANAGED_TOP_LEVEL_KEYS)
     cleaned = _remove_section(cleaned, f"model_providers.{PROVIDER_NAME}")
-    provider_name = _provider_display_name(models, default_slug)
+    provider_name = _provider_display_name(models, default_slug, router_config)
     top_block, provider_block = _managed_config_blocks(
         default_slug, port, previous_top_level, provider_name=provider_name
     )
@@ -200,6 +214,9 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
 def list_models(settings_path: Path) -> int:
     models = _load_models(settings_path)
     rows: list[tuple[str, str, str, str]] = []
+    router_config = _active_router(models, settings_path)
+    if router_config is not None:
+        rows.append((router_config.slug, router_config.display_name, "per-task pick", "auto"))
     if chatgpt_passthrough_available():
         for slug, display_name in chatgpt_passthrough_display_names().items():
             rows.append((slug, display_name, slug, "chatgpt"))
@@ -611,7 +628,9 @@ end tell
         pass
 
 
-def _provider_display_name(models, slug: str) -> str:
+def _provider_display_name(models, slug: str, router_config=None) -> str:
+    if router_config is not None and slug == router_config.slug:
+        return router_config.display_name
     if chatgpt_passthrough_available():
         display_name = chatgpt_passthrough_display_names().get(slug)
         if display_name:
@@ -783,15 +802,17 @@ def _override_args(settings_path: Path, port: int) -> list[str]:
     return args
 
 
-def _resolve_model_slug(models, requested: str | None) -> str:
+def _resolve_model_slug(models, requested: str | None, router_config=None) -> str:
     if requested is None:
         current = _current_managed_model()
-        if current in _valid_model_slugs(models):
+        if current in _valid_model_slugs(models, router_config):
             return current
         try:
             return default_model_slug(models)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
+    if router_config is not None and requested == router_config.slug:
+        return requested
     if is_chatgpt_passthrough_slug(requested):
         if not chatgpt_passthrough_available():
             raise SystemExit(
@@ -853,8 +874,10 @@ def _current_managed_model() -> str | None:
     return None
 
 
-def _valid_model_slugs(models) -> set[str]:
+def _valid_model_slugs(models, router_config=None) -> set[str]:
     slugs = {model.slug for model in usable_byok_models(models)}
+    if router_config is not None:
+        slugs.add(router_config.slug)
     if chatgpt_passthrough_available():
         slugs.update(chatgpt_passthrough_slugs())
     if cursor_passthrough_available():
