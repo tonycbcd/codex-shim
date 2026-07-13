@@ -66,8 +66,25 @@ class ShimServer:
     def __init__(self, settings_path: Path = DEFAULT_SETTINGS, host: str = DEFAULT_HOST):
         self.settings = ModelSettings(settings_path)
         self.host = host
-        self.timeout = ClientTimeout(total=None, sock_connect=120, sock_read=None)
+        self.timeout = ClientTimeout(total=None, sock_connect=30, sock_read=None)
         self.picker_token = secrets.token_urlsafe(32)
+        self._session: ClientSession | None = None
+
+    async def _get_session(self) -> ClientSession:
+        """Return a persistent ClientSession with connection pooling."""
+        if self._session is None or self._session.closed:
+            from aiohttp import TCPConnector
+            connector = TCPConnector(
+                limit=20,
+                keepalive_timeout=300,
+                enable_cleanup_closed=True,
+                ttl_dns_cache=600,
+            )
+            self._session = ClientSession(
+                timeout=self.timeout,
+                connector=connector,
+            )
+        return self._session
 
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
@@ -497,19 +514,23 @@ class ShimServer:
         }
         url = "https://chatgpt.com/backend-api/codex/responses"
         import asyncio as _asyncio
-        async with ClientSession(timeout=self.timeout) as session:
-            max_retries = 5
-            for attempt in range(max_retries):
-                upstream = await session.post(url, json=forwarded, headers=headers)
-                if upstream.status in (429, 503, 529):
-                    body_text = await upstream.text()
-                    if attempt < max_retries - 1:
-                        wait = 2 ** attempt + 1
-                        print(f"[shim] ChatGPT returned {upstream.status}, retrying in {wait}s (attempt {attempt+1}/{max_retries}): {body_text[:200]}", flush=True)
-                        await _asyncio.sleep(wait)
-                        continue
-                if upstream.status >= 400:
-                    return await _error_response(upstream)
+        session = await self._get_session()
+        t0 = time.time()
+        max_retries = 5
+        for attempt in range(max_retries):
+            upstream = await session.post(url, json=forwarded, headers=headers)
+            t1 = time.time()
+            print(f"[shim] POST /codex/responses status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1}", flush=True)
+            if upstream.status in (429, 503, 529):
+                body_text = await upstream.text()
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt + 1
+                    print(f"[shim] retrying in {wait}s: {body_text[:200]}", flush=True)
+                    await _asyncio.sleep(wait)
+                    t0 = time.time()
+                    continue
+            if upstream.status >= 400:
+                return await _error_response(upstream)
             if not forwarded.get("stream"):
                 payload = await upstream.json(content_type=None)
                 _rewrite_response_model(payload, response_model_override)
@@ -562,6 +583,7 @@ class ShimServer:
         original_model = str(forwarded.get("model") or "")
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
         forwarded.pop("stream", None)
+        forwarded.pop("store", None)
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -573,20 +595,24 @@ class ShimServer:
         }
         url = "https://chatgpt.com/backend-api/codex/responses/compact"
         import asyncio as _asyncio
-        async with ClientSession(timeout=self.timeout) as session:
-            max_retries = 5
-            for attempt in range(max_retries):
-                upstream = await session.post(url, json=forwarded, headers=headers)
-                if upstream.status in (429, 503, 529):
-                    body_text = await upstream.text()
-                    if attempt < max_retries - 1:
-                        wait = 2 ** attempt + 1
-                        print(f"[shim] ChatGPT compact returned {upstream.status}, retrying in {wait}s (attempt {attempt+1}/{max_retries}): {body_text[:200]}", flush=True)
-                        await _asyncio.sleep(wait)
-                        continue
-                if upstream.status >= 400:
-                    return await _error_response(upstream)
-            payload = await upstream.json(content_type=None)
+        session = await self._get_session()
+        t0 = time.time()
+        max_retries = 5
+        for attempt in range(max_retries):
+            upstream = await session.post(url, json=forwarded, headers=headers)
+            t1 = time.time()
+            print(f"[shim] POST /codex/responses/compact status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1}", flush=True)
+            if upstream.status in (429, 503, 529):
+                body_text = await upstream.text()
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt + 1
+                    print(f"[shim] retrying in {wait}s: {body_text[:200]}", flush=True)
+                    await _asyncio.sleep(wait)
+                    t0 = time.time()
+                    continue
+            if upstream.status >= 400:
+                return await _error_response(upstream)
+        payload = await upstream.json(content_type=None)
         _rewrite_response_model(payload, original_model or None)
         return web.json_response(payload)
 
