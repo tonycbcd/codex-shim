@@ -496,10 +496,20 @@ class ShimServer:
             "session_id": request.headers.get("session_id", ""),
         }
         url = "https://chatgpt.com/backend-api/codex/responses"
+        import asyncio as _asyncio
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
-            if upstream.status >= 400:
-                return await _error_response(upstream)
+            max_retries = 5
+            for attempt in range(max_retries):
+                upstream = await session.post(url, json=forwarded, headers=headers)
+                if upstream.status in (429, 503, 529):
+                    body_text = await upstream.text()
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt + 1
+                        print(f"[shim] ChatGPT returned {upstream.status}, retrying in {wait}s (attempt {attempt+1}/{max_retries}): {body_text[:200]}", flush=True)
+                        await _asyncio.sleep(wait)
+                        continue
+                if upstream.status >= 400:
+                    return await _error_response(upstream)
             if not forwarded.get("stream"):
                 payload = await upstream.json(content_type=None)
                 _rewrite_response_model(payload, response_model_override)
@@ -562,10 +572,20 @@ class ShimServer:
             "session_id": request.headers.get("session_id", ""),
         }
         url = "https://chatgpt.com/backend-api/codex/responses/compact"
+        import asyncio as _asyncio
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
-            if upstream.status >= 400:
-                return await _error_response(upstream)
+            max_retries = 5
+            for attempt in range(max_retries):
+                upstream = await session.post(url, json=forwarded, headers=headers)
+                if upstream.status in (429, 503, 529):
+                    body_text = await upstream.text()
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt + 1
+                        print(f"[shim] ChatGPT compact returned {upstream.status}, retrying in {wait}s (attempt {attempt+1}/{max_retries}): {body_text[:200]}", flush=True)
+                        await _asyncio.sleep(wait)
+                        continue
+                if upstream.status >= 400:
+                    return await _error_response(upstream)
             payload = await upstream.json(content_type=None)
         _rewrite_response_model(payload, original_model or None)
         return web.json_response(payload)
