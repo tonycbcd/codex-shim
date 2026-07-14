@@ -1026,6 +1026,15 @@ def _sanitize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
         sanitized = {}
     sanitized["store"] = False
     sanitized["stream"] = True
+    # Cap reasoning effort to reduce wait times (configurable via env CODEX_SHIM_REASONING_EFFORT)
+    import os
+    effort = os.environ.get("CODEX_SHIM_REASONING_EFFORT", "").strip()
+    if effort and effort in ("low", "medium", "high"):
+        reasoning = sanitized.get("reasoning")
+        if isinstance(reasoning, dict):
+            reasoning["effort"] = effort
+        else:
+            sanitized["reasoning"] = {"effort": effort}
     return sanitized
 
 

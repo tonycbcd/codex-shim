@@ -3,6 +3,8 @@
 cd /opt/codes/codex-shim
 export PYTHONPATH="/opt/codes/codex-shim:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
+# Reasoning effort: low / medium / high (low = fastest, high = best quality)
+export CODEX_SHIM_REASONING_EFFORT=low
 
 while true; do
     echo "[shim-guard] Starting codex-shim at $(date)" >> /tmp/shim.log
