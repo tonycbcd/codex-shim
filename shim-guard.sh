@@ -9,7 +9,7 @@ export CODEX_SHIM_REASONING_EFFORT=medium
 export CODEX_SHIM_FALLBACK_TIMEOUT=60
 export CODEX_SHIM_FALLBACK_URL=http://localhost:8000
 export CODEX_SHIM_FALLBACK_KEY=my-super-secret-password-123
-export CODEX_SHIM_FALLBACK_MODEL=claude-sonnet-4.5
+export CODEX_SHIM_FALLBACK_MODEL=claude-opus-4.6
 
 while true; do
     # Kill any lingering process on port 8765 before starting
