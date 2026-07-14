@@ -1020,21 +1020,92 @@ class ShimServer:
 _DROP_ITEM = object()
 
 
+def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
+    """Optimize input context to reduce token count without losing conversation structure.
+
+    Strategies:
+    1. Strip reasoning content from older messages (keep only recent 6 reasoning blocks)
+    2. Truncate overly long tool outputs (keep first/last 500 chars for old ones)
+    3. Dynamic reasoning effort based on input size
+    """
+    import os
+
+    input_items = body.get("input")
+    if not isinstance(input_items, list):
+        return body
+
+    item_count = len(input_items)
+
+    # Dynamic reasoning effort: degrade when context is huge
+    effort_env = os.environ.get("CODEX_SHIM_REASONING_EFFORT", "").strip()
+    if not effort_env:
+        if item_count > 150:
+            effort_env = "low"
+        elif item_count > 80:
+            effort_env = "medium"
+
+    if effort_env and effort_env in ("low", "medium", "high"):
+        reasoning = body.get("reasoning")
+        if isinstance(reasoning, dict):
+            reasoning["effort"] = effort_env
+        else:
+            body["reasoning"] = {"effort": effort_env}
+
+    # Find reasoning items and strip old ones (keep last 6)
+    reasoning_indices = []
+    for i, item in enumerate(input_items):
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            reasoning_indices.append(i)
+
+    if len(reasoning_indices) > 6:
+        for idx in reasoning_indices[:-6]:
+            item = input_items[idx]
+            # Replace reasoning content with minimal placeholder
+            if isinstance(item.get("content"), list):
+                item["content"] = [{"type": "input_text", "text": "..."}]
+            elif isinstance(item.get("content"), str):
+                item["content"] = "..."
+            # Also clear summary if present
+            if "summary" in item:
+                item["summary"] = "..."
+
+    # Truncate long tool outputs (older than last 10 items)
+    MAX_OUTPUT_LEN = 3000
+    if item_count > 10:
+        for item in input_items[:-10]:
+            if isinstance(item, dict):
+                _truncate_tool_output(item, MAX_OUTPUT_LEN)
+                # Also handle nested content arrays
+                content = item.get("content")
+                if isinstance(content, list):
+                    for sub in content:
+                        if isinstance(sub, dict):
+                            _truncate_tool_output(sub, MAX_OUTPUT_LEN)
+
+    return body
+
+
+def _truncate_tool_output(item: dict[str, Any], max_len: int) -> None:
+    """Truncate tool output text if too long."""
+    if item.get("type") in ("function_call_output", "custom_tool_call_output"):
+        output = item.get("output") or item.get("text") or ""
+        if isinstance(output, str) and len(output) > max_len:
+            half = max_len // 2
+            truncated = output[:half] + f"\n\n... [{len(output) - max_len} chars truncated] ...\n\n" + output[-half:]
+            if "output" in item:
+                item["output"] = truncated
+            elif "text" in item:
+                item["text"] = truncated
+
+
 def _sanitize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
     sanitized = _sanitize_chatgpt_passthrough_value(body)
     if not isinstance(sanitized, dict):
         sanitized = {}
     sanitized["store"] = False
     sanitized["stream"] = True
-    # Cap reasoning effort to reduce wait times (configurable via env CODEX_SHIM_REASONING_EFFORT)
-    import os
-    effort = os.environ.get("CODEX_SHIM_REASONING_EFFORT", "").strip()
-    if effort and effort in ("low", "medium", "high"):
-        reasoning = sanitized.get("reasoning")
-        if isinstance(reasoning, dict):
-            reasoning["effort"] = effort
-        else:
-            sanitized["reasoning"] = {"effort": effort}
+    # Optimize context before sending
+    sanitized = _optimize_input_context(sanitized)
     return sanitized
 
 
