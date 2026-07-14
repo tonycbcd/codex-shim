@@ -76,7 +76,7 @@ class ShimServer:
             from aiohttp import TCPConnector
             connector = TCPConnector(
                 limit=20,
-                keepalive_timeout=300,
+                keepalive_timeout=120,
                 enable_cleanup_closed=True,
                 ttl_dns_cache=600,
             )
@@ -85,6 +85,13 @@ class ShimServer:
                 connector=connector,
             )
         return self._session
+
+    async def _reset_session(self) -> ClientSession:
+        """Close stale session and create a fresh one."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
+        return await self._get_session()
 
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
@@ -514,11 +521,21 @@ class ShimServer:
         }
         url = "https://chatgpt.com/backend-api/codex/responses"
         import asyncio as _asyncio
+        from aiohttp import ClientConnectorError, ServerDisconnectedError, ClientOSError
         session = await self._get_session()
         t0 = time.time()
         max_retries = 5
         for attempt in range(max_retries):
-            upstream = await session.post(url, json=forwarded, headers=headers)
+            try:
+                upstream = await session.post(url, json=forwarded, headers=headers)
+            except (ClientConnectorError, ServerDisconnectedError, ClientOSError, ConnectionResetError) as e:
+                if attempt < max_retries - 1:
+                    print(f"[shim] connection error, resetting session (attempt {attempt+1}): {e}", flush=True)
+                    session = await self._reset_session()
+                    await _asyncio.sleep(1)
+                    t0 = time.time()
+                    continue
+                raise
             t1 = time.time()
             print(f"[shim] POST /codex/responses status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1}", flush=True)
             if upstream.status in (429, 503, 529):
@@ -595,11 +612,21 @@ class ShimServer:
         }
         url = "https://chatgpt.com/backend-api/codex/responses/compact"
         import asyncio as _asyncio
+        from aiohttp import ClientConnectorError, ServerDisconnectedError, ClientOSError
         session = await self._get_session()
         t0 = time.time()
         max_retries = 5
         for attempt in range(max_retries):
-            upstream = await session.post(url, json=forwarded, headers=headers)
+            try:
+                upstream = await session.post(url, json=forwarded, headers=headers)
+            except (ClientConnectorError, ServerDisconnectedError, ClientOSError, ConnectionResetError) as e:
+                if attempt < max_retries - 1:
+                    print(f"[shim] compact connection error, resetting session (attempt {attempt+1}): {e}", flush=True)
+                    session = await self._reset_session()
+                    await _asyncio.sleep(1)
+                    t0 = time.time()
+                    continue
+                raise
             t1 = time.time()
             print(f"[shim] POST /codex/responses/compact status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1}", flush=True)
             if upstream.status in (429, 503, 529):
