@@ -3,8 +3,13 @@
 cd /opt/codes/codex-shim
 export PYTHONPATH="/opt/codes/codex-shim:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
-# Reasoning effort: low / medium / high (low = fastest, high = best quality)
+# Reasoning effort override (leave empty to use Codex default)
 export CODEX_SHIM_REASONING_EFFORT=medium
+# Fallback: if ChatGPT takes longer than this (seconds), use kiro-gateway
+export CODEX_SHIM_FALLBACK_TIMEOUT=60
+export CODEX_SHIM_FALLBACK_URL=http://localhost:8000
+export CODEX_SHIM_FALLBACK_KEY=my-super-secret-password-123
+export CODEX_SHIM_FALLBACK_MODEL=claude-sonnet-4.5
 
 while true; do
     # Kill any lingering process on port 8765 before starting

@@ -522,12 +522,23 @@ class ShimServer:
         url = "https://chatgpt.com/backend-api/codex/responses"
         import asyncio as _asyncio
         from aiohttp import ClientConnectorError, ServerDisconnectedError, ClientOSError
+        import os
+        FALLBACK_TIMEOUT = int(os.environ.get("CODEX_SHIM_FALLBACK_TIMEOUT", "60"))
         session = await self._get_session()
         t0 = time.time()
         max_retries = 5
+        timed_out = False
         for attempt in range(max_retries):
             try:
-                upstream = await session.post(url, json=forwarded, headers=headers)
+                upstream = await _asyncio.wait_for(
+                    session.post(url, json=forwarded, headers=headers),
+                    timeout=FALLBACK_TIMEOUT,
+                )
+            except _asyncio.TimeoutError:
+                elapsed = time.time() - t0
+                print(f"[shim] ChatGPT timed out after {elapsed:.1f}s, falling back to kiro-gateway", flush=True)
+                timed_out = True
+                break
             except (ClientConnectorError, ServerDisconnectedError, ClientOSError, ConnectionResetError) as e:
                 if attempt < max_retries - 1:
                     print(f"[shim] connection error, resetting session (attempt {attempt+1}): {e}", flush=True)
@@ -546,39 +557,166 @@ class ShimServer:
                     await _asyncio.sleep(wait)
                     t0 = time.time()
                     continue
+                # Last attempt still rate-limited, fallback
+                print(f"[shim] ChatGPT rate-limited after {max_retries} attempts, falling back to kiro-gateway", flush=True)
+                timed_out = True
+                break
             if upstream.status >= 400:
                 return await _error_response(upstream)
-            if not forwarded.get("stream"):
-                payload = await upstream.json(content_type=None)
-                _rewrite_response_model(payload, response_model_override)
-                return web.json_response(payload)
-            response = _sse_response()
-            await response.prepare(request)
-            try:
-                if response_model_override:
-                    async for line in _sse_lines(upstream):
-                        if line == "[DONE]":
-                            await _safe_write(response, b"data: [DONE]\n\n")
-                            break
-                        try:
-                            payload = json.loads(line)
-                        except json.JSONDecodeError:
-                            await _safe_write(response, f"data: {line}\n\n".encode())
-                            continue
-                        _rewrite_response_model(payload, response_model_override)
-                        await _write_sse(response, payload)
-                else:
-                    async for chunk in upstream.content.iter_chunked(4096):
-                        await _safe_write(response, chunk)
-            except ClientDisconnected:
-                pass
-            finally:
-                upstream.release()
-            try:
-                await response.write_eof()
-            except Exception:
-                pass
-            return response
+            break
+
+        if timed_out:
+            return await self._kiro_fallback(request, body, response_model_override)
+
+        if not forwarded.get("stream"):
+            payload = await upstream.json(content_type=None)
+            _rewrite_response_model(payload, response_model_override)
+            return web.json_response(payload)
+        response = _sse_response()
+        await response.prepare(request)
+        try:
+            if response_model_override:
+                async for line in _sse_lines(upstream):
+                    if line == "[DONE]":
+                        await _safe_write(response, b"data: [DONE]\n\n")
+                        break
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        await _safe_write(response, f"data: {line}\n\n".encode())
+                        continue
+                    _rewrite_response_model(payload, response_model_override)
+                    await _write_sse(response, payload)
+            else:
+                async for chunk in upstream.content.iter_chunked(4096):
+                    await _safe_write(response, chunk)
+        except ClientDisconnected:
+            pass
+        finally:
+            upstream.release()
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
+
+    async def _kiro_fallback(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        response_model_override: str | None = None,
+    ) -> web.StreamResponse:
+        """Fallback to kiro-gateway (local Claude) when ChatGPT times out or is rate-limited."""
+        import os
+        KIRO_URL = os.environ.get("CODEX_SHIM_FALLBACK_URL", "http://localhost:8000")
+        KIRO_KEY = os.environ.get("CODEX_SHIM_FALLBACK_KEY", "my-super-secret-password-123")
+        KIRO_MODEL = os.environ.get("CODEX_SHIM_FALLBACK_MODEL", "claude-sonnet-4.5")
+
+        # Convert responses-format to chat completions format
+        chat_body = responses_to_chat(body, KIRO_MODEL)
+        chat_body["stream"] = True
+
+        headers = {
+            "Authorization": f"Bearer {KIRO_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        url = f"{KIRO_URL}/v1/chat/completions"
+        session = await self._get_session()
+        t0 = time.time()
+
+        try:
+            upstream = await session.post(url, json=chat_body, headers=headers)
+        except Exception as e:
+            print(f"[shim] kiro-gateway fallback failed: {e}", flush=True)
+            raise web.HTTPServiceUnavailable(text=f"Both ChatGPT and kiro-gateway failed: {e}")
+
+        t1 = time.time()
+        print(f"[shim] FALLBACK kiro-gateway status={upstream.status} elapsed={t1-t0:.2f}s model={KIRO_MODEL}", flush=True)
+
+        if upstream.status >= 400:
+            err_text = await upstream.text()
+            print(f"[shim] kiro-gateway error: {err_text[:300]}", flush=True)
+            raise web.HTTPServiceUnavailable(text=f"Kiro-gateway returned {upstream.status}")
+
+        # Stream SSE back, translating chat completion chunks to responses format
+        response = _sse_response()
+        await response.prepare(request)
+
+        resp_id = f"resp_{uuid.uuid4().hex[:48]}"
+        model_name = response_model_override or "gpt-5.5"
+
+        # Send response.created event
+        created_event = {
+            "type": "response.created",
+            "response": {
+                "id": resp_id,
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "in_progress",
+                "model": model_name,
+                "output": [],
+            },
+        }
+        await _safe_write(response, f"event: response.created\ndata: {json.dumps(created_event)}\n\n".encode())
+
+        # Collect and stream content
+        full_content = ""
+        try:
+            async for line in _sse_lines(upstream):
+                if line == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    full_content += content
+                    # Send as output_text.delta
+                    text_delta = {
+                        "type": "response.output_text.delta",
+                        "item_id": f"msg_{uuid.uuid4().hex[:48]}",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": content,
+                    }
+                    await _safe_write(response, f"event: response.output_text.delta\ndata: {json.dumps(text_delta)}\n\n".encode())
+        except ClientDisconnected:
+            pass
+        finally:
+            upstream.release()
+
+        # Send response.completed event
+        completed_event = {
+            "type": "response.completed",
+            "response": {
+                "id": resp_id,
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "completed",
+                "model": model_name,
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": full_content}],
+                    }
+                ],
+            },
+        }
+        await _safe_write(response, f"event: response.completed\ndata: {json.dumps(completed_event)}\n\n".encode())
+        await _safe_write(response, b"data: [DONE]\n\n")
+
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
 
     async def _chatgpt_compact_passthrough(
         self,
@@ -1025,8 +1163,7 @@ def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
 
     Strategies:
     1. Strip reasoning content from older messages (keep only recent 6 reasoning blocks)
-    2. Truncate overly long tool outputs (keep first/last 500 chars for old ones)
-    3. Dynamic reasoning effort based on input size
+    2. Truncate overly long tool outputs (keep first/last 1500 chars for old ones)
     """
     import os
 
@@ -1036,14 +1173,8 @@ def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
 
     item_count = len(input_items)
 
-    # Dynamic reasoning effort: degrade when context is huge
+    # Apply env-based reasoning effort override if set (no auto-degradation)
     effort_env = os.environ.get("CODEX_SHIM_REASONING_EFFORT", "").strip()
-    if not effort_env:
-        if item_count > 150:
-            effort_env = "low"
-        elif item_count > 80:
-            effort_env = "medium"
-
     if effort_env and effort_env in ("low", "medium", "high"):
         reasoning = body.get("reasoning")
         if isinstance(reasoning, dict):
@@ -1067,7 +1198,7 @@ def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
                 item["content"] = "..."
             # Also clear summary if present
             if "summary" in item:
-                item["summary"] = "..."
+                item["summary"] = [{"type": "summary_text", "text": "..."}]
 
     # Truncate long tool outputs (older than last 10 items)
     MAX_OUTPUT_LEN = 3000
