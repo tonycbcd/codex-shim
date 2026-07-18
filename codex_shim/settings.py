@@ -163,7 +163,7 @@ def chatgpt_upstream_model(slug: str, cache_path: Path | None = None) -> str:
 
 
 def slugify(value: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    slug = re.sub(r"[^a-zA-Z0-9.]+", "-", value.strip().lower()).strip("-")
     return slug or "model"
 
 

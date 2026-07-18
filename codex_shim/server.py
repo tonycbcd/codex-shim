@@ -266,7 +266,7 @@ class ShimServer:
         _log_incoming_request("/v1/responses", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
-        if is_chatgpt_passthrough_slug(model):
+        if is_chatgpt_passthrough_slug(model) and chatgpt_passthrough_available():
             upstream = chatgpt_upstream_model(model)
             override = model if model != upstream else None
             return await self._chatgpt_passthrough(
@@ -275,6 +275,9 @@ class ShimServer:
                 response_model_override=override,
                 upstream_model=upstream,
             )
+        if is_chatgpt_passthrough_slug(model) and not chatgpt_passthrough_available():
+            print(f"[shim] ⚠️  ChatGPT passthrough unavailable (no valid auth.json), using OpenAI API for {model}", flush=True)
+            return await self._openai_api_fallback(request, body, response_model_override=model)
         if is_cursor_passthrough_slug(model):
             return await self._cursor_passthrough(
                 request,
@@ -298,9 +301,12 @@ class ShimServer:
         _log_incoming_request("/v1/responses/compact", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
-        if is_chatgpt_passthrough_slug(model):
+        if is_chatgpt_passthrough_slug(model) and chatgpt_passthrough_available():
             upstream = chatgpt_upstream_model(model)
             return await self._chatgpt_compact_passthrough(request, body, upstream_model=upstream)
+        if is_chatgpt_passthrough_slug(model) and not chatgpt_passthrough_available():
+            print(f"[shim] ⚠️  ChatGPT passthrough unavailable for compact, using OpenAI API for {model}", flush=True)
+            return await self._openai_api_fallback(request, body, response_model_override=model)
         if is_cursor_passthrough_slug(model):
             compact_body = dict(body)
             compact_body["input"] = body.get("input") or []
@@ -510,6 +516,9 @@ class ShimServer:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
+        # ChatGPT /codex/responses requires input to be a list
+        if isinstance(forwarded.get("input"), str):
+            forwarded["input"] = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": forwarded["input"]}]}]
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -619,7 +628,7 @@ class ShimServer:
         """Fallback to OpenAI official API when ChatGPT passthrough fails."""
         import os
         OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
-        OPENAI_MODEL = os.environ.get("CODEX_SHIM_OPENAI_FALLBACK_MODEL", "gpt-4.1")
+        OPENAI_MODEL = os.environ.get("CODEX_SHIM_OPENAI_FALLBACK_MODEL", "gpt-5.5")
 
         if not OPENAI_KEY:
             raise web.HTTPServiceUnavailable(text="ChatGPT failed and no OPENAI_API_KEY set for fallback")
@@ -627,6 +636,9 @@ class ShimServer:
         # Convert responses-format to chat completions format
         chat_body = responses_to_chat(body, OPENAI_MODEL)
         chat_body["stream"] = True
+        # Remove parallel_tool_calls when no tools are present (OpenAI rejects it)
+        if not chat_body.get("tools") and "parallel_tool_calls" in chat_body:
+            del chat_body["parallel_tool_calls"]
 
         headers = {
             "Authorization": f"Bearer {OPENAI_KEY}",
@@ -671,6 +683,9 @@ class ShimServer:
             },
         }
         await _safe_write(response, f"event: response.created\ndata: {json.dumps(created_event)}\n\n".encode())
+
+        # Inject fallback notice (console only - don't inject into response to avoid breaking Codex parser)
+        # notice is logged server-side already via print() above
 
         # Collect and stream content
         full_content = ""
