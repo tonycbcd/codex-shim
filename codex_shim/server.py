@@ -536,7 +536,9 @@ class ShimServer:
                 )
             except _asyncio.TimeoutError:
                 elapsed = time.time() - t0
-                print(f"[shim] ChatGPT timed out after {elapsed:.1f}s, falling back to kiro-gateway", flush=True)
+                print(f"\n{'='*60}", flush=True)
+                print(f"[shim] ⚠️  ChatGPT TIMEOUT after {elapsed:.1f}s, switching to OpenAI API fallback", flush=True)
+                print(f"{'='*60}\n", flush=True)
                 timed_out = True
                 break
             except (ClientConnectorError, ServerDisconnectedError, ClientOSError, ConnectionResetError) as e:
@@ -558,15 +560,23 @@ class ShimServer:
                     t0 = time.time()
                     continue
                 # Last attempt still rate-limited, fallback
-                print(f"[shim] ChatGPT rate-limited after {max_retries} attempts, falling back to kiro-gateway", flush=True)
+                print(f"\n{'='*60}", flush=True)
+                print(f"[shim] ⚠️  ChatGPT RATE-LIMITED after {max_retries} attempts, switching to OpenAI API fallback", flush=True)
+                print(f"{'='*60}\n", flush=True)
                 timed_out = True
                 break
             if upstream.status >= 400:
-                return await _error_response(upstream)
+                err_text = await upstream.text()
+                print(f"\n{'='*60}", flush=True)
+                print(f"[shim] ⚠️  ChatGPT FAILED (status {upstream.status}), switching to OpenAI API fallback", flush=True)
+                print(f"[shim] Error: {err_text[:150]}", flush=True)
+                print(f"{'='*60}\n", flush=True)
+                timed_out = True
+                break
             break
 
         if timed_out:
-            return await self._kiro_fallback(request, body, response_model_override)
+            return await self._openai_api_fallback(request, body, response_model_override)
 
         if not forwarded.get("stream"):
             payload = await upstream.json(content_type=None)
@@ -600,44 +610,46 @@ class ShimServer:
             pass
         return response
 
-    async def _kiro_fallback(
+    async def _openai_api_fallback(
         self,
         request: web.Request,
         body: dict[str, Any],
         response_model_override: str | None = None,
     ) -> web.StreamResponse:
-        """Fallback to kiro-gateway (local Claude) when ChatGPT times out or is rate-limited."""
+        """Fallback to OpenAI official API when ChatGPT passthrough fails."""
         import os
-        KIRO_URL = os.environ.get("CODEX_SHIM_FALLBACK_URL", "http://localhost:8000")
-        KIRO_KEY = os.environ.get("CODEX_SHIM_FALLBACK_KEY", "my-super-secret-password-123")
-        KIRO_MODEL = os.environ.get("CODEX_SHIM_FALLBACK_MODEL", "claude-sonnet-4.5")
+        OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
+        OPENAI_MODEL = os.environ.get("CODEX_SHIM_OPENAI_FALLBACK_MODEL", "gpt-4.1")
+
+        if not OPENAI_KEY:
+            raise web.HTTPServiceUnavailable(text="ChatGPT failed and no OPENAI_API_KEY set for fallback")
 
         # Convert responses-format to chat completions format
-        chat_body = responses_to_chat(body, KIRO_MODEL)
+        chat_body = responses_to_chat(body, OPENAI_MODEL)
         chat_body["stream"] = True
 
         headers = {
-            "Authorization": f"Bearer {KIRO_KEY}",
+            "Authorization": f"Bearer {OPENAI_KEY}",
             "Content-Type": "application/json",
         }
 
-        url = f"{KIRO_URL}/v1/chat/completions"
+        url = "https://api.openai.com/v1/chat/completions"
         session = await self._get_session()
         t0 = time.time()
 
         try:
             upstream = await session.post(url, json=chat_body, headers=headers)
         except Exception as e:
-            print(f"[shim] kiro-gateway fallback failed: {e}", flush=True)
-            raise web.HTTPServiceUnavailable(text=f"Both ChatGPT and kiro-gateway failed: {e}")
+            print(f"[shim] OpenAI API fallback failed: {e}", flush=True)
+            raise web.HTTPServiceUnavailable(text=f"Both ChatGPT and OpenAI API failed: {e}")
 
         t1 = time.time()
-        print(f"[shim] FALLBACK kiro-gateway status={upstream.status} elapsed={t1-t0:.2f}s model={KIRO_MODEL}", flush=True)
+        print(f"[shim] FALLBACK OpenAI API status={upstream.status} elapsed={t1-t0:.2f}s model={OPENAI_MODEL}", flush=True)
 
         if upstream.status >= 400:
             err_text = await upstream.text()
-            print(f"[shim] kiro-gateway error: {err_text[:300]}", flush=True)
-            raise web.HTTPServiceUnavailable(text=f"Kiro-gateway returned {upstream.status}")
+            print(f"[shim] OpenAI API error: {err_text[:300]}", flush=True)
+            raise web.HTTPServiceUnavailable(text=f"OpenAI API returned {upstream.status}: {err_text[:200]}")
 
         # Stream SSE back, translating chat completion chunks to responses format
         response = _sse_response()
@@ -677,7 +689,6 @@ class ShimServer:
                 content = delta.get("content", "")
                 if content:
                     full_content += content
-                    # Send as output_text.delta
                     text_delta = {
                         "type": "response.output_text.delta",
                         "item_id": f"msg_{uuid.uuid4().hex[:48]}",
