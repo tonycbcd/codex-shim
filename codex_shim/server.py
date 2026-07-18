@@ -591,11 +591,62 @@ class ShimServer:
             payload = await upstream.json(content_type=None)
             _rewrite_response_model(payload, response_model_override)
             return web.json_response(payload)
-        response = _sse_response()
-        await response.prepare(request)
-        try:
-            if response_model_override:
-                async for line in _sse_lines(upstream):
+
+        # --- In-stream error detection: buffer early data before committing ---
+        _STREAM_ERROR_PHRASES = (
+            "high demand",
+            "experiencing high demand",
+            "temporarily unavailable",
+            "server_error",
+            "overloaded",
+            "capacity",
+        )
+
+        def _stream_has_error(text: str) -> bool:
+            low = text.lower()
+            return any(phrase in low for phrase in _STREAM_ERROR_PHRASES)
+
+        if response_model_override:
+            # Buffer SSE lines until we see actual content or an error.
+            # "high demand" errors arrive AFTER metadata events (response.created,
+            # response.in_progress) but BEFORE any content delta. So we buffer
+            # until we see a content delta, then commit. If we see an error first,
+            # we fallback.
+            buffered_lines: list[str] = []
+            stream_error_detected = False
+            lines_iter = _sse_lines(upstream)
+            _sentinel = object()
+            # Buffer up to 30 events (covers metadata + error/first-content)
+            for _ in range(30):
+                try:
+                    line = await _asyncio.wait_for(anext(lines_iter, _sentinel), timeout=15)  # type: ignore[arg-type]
+                except _asyncio.TimeoutError:
+                    break
+                if line is _sentinel:
+                    break
+                buffered_lines.append(line)
+                if line == "[DONE]":
+                    break
+                if _stream_has_error(line):
+                    stream_error_detected = True
+                    break
+                # If we see a content delta, it means real content is flowing — safe to commit
+                if '"output_text.delta"' in line or '"response.output_item.added"' in line:
+                    break
+
+            if stream_error_detected:
+                upstream.release()
+                print(f"\n{'='*60}", flush=True)
+                print(f"[shim] ⚠️  ChatGPT in-stream ERROR detected, switching to OpenAI API fallback", flush=True)
+                print(f"[shim] Trigger: {buffered_lines[-1][:200]}", flush=True)
+                print(f"{'='*60}\n", flush=True)
+                return await self._openai_api_fallback(request, body, response_model_override)
+
+            # No error — prepare response and flush buffered lines
+            response = _sse_response()
+            await response.prepare(request)
+            try:
+                for line in buffered_lines:
                     if line == "[DONE]":
                         await _safe_write(response, b"data: [DONE]\n\n")
                         break
@@ -606,13 +657,56 @@ class ShimServer:
                         continue
                     _rewrite_response_model(payload, response_model_override)
                     await _write_sse(response, payload)
-            else:
+                else:
+                    # Continue streaming remaining lines
+                    async for line in lines_iter:
+                        if line == "[DONE]":
+                            await _safe_write(response, b"data: [DONE]\n\n")
+                            break
+                        if _stream_has_error(line):
+                            # Late error — can't fallback now, just log
+                            print(f"[shim] ⚠️  late in-stream error (already streaming): {line[:150]}", flush=True)
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            await _safe_write(response, f"data: {line}\n\n".encode())
+                            continue
+                        _rewrite_response_model(payload, response_model_override)
+                        await _write_sse(response, payload)
+            except ClientDisconnected:
+                pass
+            finally:
+                upstream.release()
+        else:
+            # Raw chunk path — buffer first chunk to detect errors
+            first_chunk = b""
+            try:
+                first_chunk = await _asyncio.wait_for(
+                    upstream.content.read(4096), timeout=10
+                )
+            except (_asyncio.TimeoutError, Exception):
+                pass
+
+            if first_chunk and _stream_has_error(first_chunk.decode("utf-8", errors="replace")):
+                upstream.release()
+                print(f"\n{'='*60}", flush=True)
+                print(f"[shim] ⚠️  ChatGPT in-stream ERROR detected (raw), switching to OpenAI API fallback", flush=True)
+                print(f"[shim] Trigger: {first_chunk.decode('utf-8', errors='replace')[:200]}", flush=True)
+                print(f"{'='*60}\n", flush=True)
+                return await self._openai_api_fallback(request, body, response_model_override)
+
+            response = _sse_response()
+            await response.prepare(request)
+            try:
+                if first_chunk:
+                    await _safe_write(response, first_chunk)
                 async for chunk in upstream.content.iter_chunked(4096):
                     await _safe_write(response, chunk)
-        except ClientDisconnected:
-            pass
-        finally:
-            upstream.release()
+            except ClientDisconnected:
+                pass
+            finally:
+                upstream.release()
+
         try:
             await response.write_eof()
         except Exception:
