@@ -15,7 +15,7 @@ DEFAULT_CODEX_MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 PROVIDER_NAME = "codex_shim"
-CHATGPT_MODEL_SLUG = "gpt-5.5"
+CHATGPT_MODEL_SLUG = "gpt-5.6-sol"
 FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
     "gpt-5.5",
     "gpt-5.4",

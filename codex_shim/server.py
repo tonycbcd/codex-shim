@@ -515,7 +515,12 @@ class ShimServer:
         if not access_token:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
-        forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
+        forwarded["model"] = CHATGPT_MODEL_SLUG  # Always force configured model for ChatGPT passthrough
+        # Force reasoning effort to high for ChatGPT passthrough
+        if isinstance(forwarded.get("reasoning"), dict):
+            forwarded["reasoning"]["effort"] = "high"
+        else:
+            forwarded["reasoning"] = {"effort": "high"}
         # ChatGPT /codex/responses requires input to be a list
         if isinstance(forwarded.get("input"), str):
             forwarded["input"] = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": forwarded["input"]}]}]
@@ -722,7 +727,8 @@ class ShimServer:
         """Fallback to OpenAI official API when ChatGPT passthrough fails."""
         import os
         OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
-        OPENAI_MODEL = os.environ.get("CODEX_SHIM_OPENAI_FALLBACK_MODEL", "gpt-5.5")
+        # Use the model from the original Codex request (what user selected in Codex UI)
+        OPENAI_MODEL = body.get("model") or os.environ.get("CODEX_SHIM_OPENAI_FALLBACK_MODEL", "gpt-5.6-sol")
 
         if not OPENAI_KEY:
             raise web.HTTPServiceUnavailable(text="ChatGPT failed and no OPENAI_API_KEY set for fallback")
@@ -762,7 +768,7 @@ class ShimServer:
         await response.prepare(request)
 
         resp_id = f"resp_{uuid.uuid4().hex[:48]}"
-        model_name = response_model_override or "gpt-5.5"
+        model_name = response_model_override or "gpt-5.6-sol"
 
         # Send response.created event
         created_event = {
@@ -856,7 +862,7 @@ class ShimServer:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
         original_model = str(forwarded.get("model") or "")
-        forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
+        forwarded["model"] = CHATGPT_MODEL_SLUG  # Always force configured model for ChatGPT passthrough
         forwarded.pop("stream", None)
         forwarded.pop("store", None)
         headers = {
