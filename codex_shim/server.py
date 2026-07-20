@@ -516,11 +516,11 @@ class ShimServer:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
         forwarded["model"] = CHATGPT_MODEL_SLUG  # Always force configured model for ChatGPT passthrough
-        # Force reasoning effort to high for ChatGPT passthrough
+        # Force reasoning effort to medium for ChatGPT passthrough
         if isinstance(forwarded.get("reasoning"), dict):
-            forwarded["reasoning"]["effort"] = "high"
+            forwarded["reasoning"]["effort"] = "medium"
         else:
-            forwarded["reasoning"] = {"effort": "high"}
+            forwarded["reasoning"] = {"effort": "medium"}
         # ChatGPT /codex/responses requires input to be a list
         if isinstance(forwarded.get("input"), str):
             forwarded["input"] = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": forwarded["input"]}]}]
@@ -567,6 +567,13 @@ class ShimServer:
             print(f"[shim] POST /codex/responses status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1}", flush=True)
             if upstream.status in (429, 503, 529):
                 body_text = await upstream.text()
+                # usage_limit_reached is a hard limit, no point retrying
+                if "usage_limit_reached" in body_text:
+                    print(f"\n{'='*60}", flush=True)
+                    print(f"[shim] ⚠️  ChatGPT USAGE LIMIT REACHED, immediately switching to OpenAI API fallback", flush=True)
+                    print(f"{'='*60}\n", flush=True)
+                    timed_out = True
+                    break
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt + 1
                     print(f"[shim] retrying in {wait}s: {body_text[:200]}", flush=True)
@@ -650,6 +657,7 @@ class ShimServer:
             # No error — prepare response and flush buffered lines
             response = _sse_response()
             await response.prepare(request)
+            _source_injected = False
             try:
                 for line in buffered_lines:
                     if line == "[DONE]":
@@ -660,6 +668,12 @@ class ShimServer:
                     except json.JSONDecodeError:
                         await _safe_write(response, f"data: {line}\n\n".encode())
                         continue
+                    # Inject [ChatGPT] before first content delta
+                    if not _source_injected and payload.get("type") == "response.output_text.delta":
+                        _source_injected = True
+                        source_evt = dict(payload)
+                        source_evt["delta"] = "[ChatGPT] "
+                        await _write_sse(response, source_evt)
                     _rewrite_response_model(payload, response_model_override)
                     await _write_sse(response, payload)
                 else:
@@ -676,6 +690,12 @@ class ShimServer:
                         except json.JSONDecodeError:
                             await _safe_write(response, f"data: {line}\n\n".encode())
                             continue
+                        # Inject [ChatGPT] before first content delta
+                        if not _source_injected and payload.get("type") == "response.output_text.delta":
+                            _source_injected = True
+                            source_evt = dict(payload)
+                            source_evt["delta"] = "[ChatGPT] "
+                            await _write_sse(response, source_evt)
                         _rewrite_response_model(payload, response_model_override)
                         await _write_sse(response, payload)
             except ClientDisconnected:
@@ -763,80 +783,49 @@ class ShimServer:
             print(f"[shim] OpenAI API error: {err_text[:300]}", flush=True)
             raise web.HTTPServiceUnavailable(text=f"OpenAI API returned {upstream.status}: {err_text[:200]}")
 
-        # Stream SSE back, translating chat completion chunks to responses format
+        # Stream SSE back using ResponsesStreamState (handles text + tool_calls)
         response = _sse_response()
         await response.prepare(request)
 
-        resp_id = f"resp_{uuid.uuid4().hex[:48]}"
         model_name = response_model_override or "gpt-5.6-sol"
+        tool_types = _build_tool_types(body)
+        state = ResponsesStreamState(model_name, tool_types)
 
-        # Send response.created event
-        created_event = {
-            "type": "response.created",
-            "response": {
-                "id": resp_id,
-                "object": "response",
-                "created_at": int(time.time()),
-                "status": "in_progress",
-                "model": model_name,
-                "output": [],
-            },
-        }
-        await _safe_write(response, f"event: response.created\ndata: {json.dumps(created_event)}\n\n".encode())
-
-        # Inject fallback notice (console only - don't inject into response to avoid breaking Codex parser)
-        # notice is logged server-side already via print() above
-
-        # Collect and stream content
-        full_content = ""
+        chunk_count = 0
+        source_injected = False
         try:
+            await state.start(response)
             async for line in _sse_lines(upstream):
                 if line == "[DONE]":
+                    print(f"[shim] FALLBACK stream done, chunks={chunk_count} content_len={len(state.message_text)}", flush=True)
                     break
                 try:
                     chunk = json.loads(line)
                 except json.JSONDecodeError:
+                    print(f"[shim] FALLBACK bad json: {line[:100]}", flush=True)
                     continue
                 choices = chunk.get("choices", [])
                 if not choices:
+                    if chunk_count == 0:
+                        print(f"[shim] FALLBACK no choices in chunk: {line[:200]}", flush=True)
                     continue
                 delta = choices[0].get("delta", {})
-                content = delta.get("content", "")
-                if content:
-                    full_content += content
-                    text_delta = {
-                        "type": "response.output_text.delta",
-                        "item_id": f"msg_{uuid.uuid4().hex[:48]}",
-                        "output_index": 0,
-                        "content_index": 0,
-                        "delta": content,
-                    }
-                    await _safe_write(response, f"event: response.output_text.delta\ndata: {json.dumps(text_delta)}\n\n".encode())
+                if chunk_count == 0:
+                    print(f"[shim] FALLBACK first delta keys: {list(delta.keys())} finish_reason={choices[0].get('finish_reason')}", flush=True)
+                chunk_count += 1
+                # Inject source indicator before first text content
+                if not source_injected and delta.get("content"):
+                    source_injected = True
+                    await state.write_chat_delta(
+                        response,
+                        {"choices": [{"delta": {"content": "[OpenAI API] "}}]},
+                    )
+                await state.write_chat_delta(response, chunk)
+            await state.finish(response)
         except ClientDisconnected:
             pass
         finally:
             upstream.release()
-
-        # Send response.completed event
-        completed_event = {
-            "type": "response.completed",
-            "response": {
-                "id": resp_id,
-                "object": "response",
-                "created_at": int(time.time()),
-                "status": "completed",
-                "model": model_name,
-                "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": full_content}],
-                    }
-                ],
-            },
-        }
-        await _safe_write(response, f"event: response.completed\ndata: {json.dumps(completed_event)}\n\n".encode())
-        await _safe_write(response, b"data: [DONE]\n\n")
 
         try:
             await response.write_eof()
@@ -895,6 +884,13 @@ class ShimServer:
             print(f"[shim] POST /codex/responses/compact status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1}", flush=True)
             if upstream.status in (429, 503, 529):
                 body_text = await upstream.text()
+                # usage_limit_reached is a hard limit, no point retrying
+                if "usage_limit_reached" in body_text:
+                    print(f"\n{'='*60}", flush=True)
+                    print(f"[shim] ⚠️  ChatGPT USAGE LIMIT REACHED, immediately switching to OpenAI API fallback", flush=True)
+                    print(f"{'='*60}\n", flush=True)
+                    timed_out = True
+                    break
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt + 1
                     print(f"[shim] retrying in {wait}s: {body_text[:200]}", flush=True)
