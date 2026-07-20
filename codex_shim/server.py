@@ -775,7 +775,7 @@ class ShimServer:
         """Fallback to Claude via kiro-gateway (localhost:8000). Returns None if fails."""
         CLAUDE_URL = "http://127.0.0.1:8000/v1/chat/completions"
         CLAUDE_KEY = "my-super-secret-password-123"
-        CLAUDE_MODEL = "claude-sonnet-4"
+        CLAUDE_MODEL = "claude-opus-4.6"
 
         chat_body = responses_to_chat(body, CLAUDE_MODEL)
         chat_body["stream"] = True
@@ -811,7 +811,7 @@ class ShimServer:
         response = _sse_response()
         await response.prepare(request)
 
-        model_name = response_model_override or "claude-sonnet-4"
+        model_name = response_model_override or "claude-opus-4.6"
         tool_types = _build_tool_types(body)
         state = ResponsesStreamState(model_name, tool_types)
 
