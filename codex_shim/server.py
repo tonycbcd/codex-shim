@@ -515,7 +515,8 @@ class ShimServer:
         if not access_token:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
-        forwarded["model"] = CHATGPT_MODEL_SLUG  # Always force configured model for ChatGPT passthrough
+        original_client_model = str(forwarded.get("model") or "gpt-5.5")
+        forwarded["model"] = CHATGPT_MODEL_SLUG  # First try: configured model (gpt-5.6-sol)
         # Force reasoning effort to medium for ChatGPT passthrough
         if isinstance(forwarded.get("reasoning"), dict):
             forwarded["reasoning"]["effort"] = "medium"
@@ -539,65 +540,92 @@ class ShimServer:
         import os
         FALLBACK_TIMEOUT = int(os.environ.get("CODEX_SHIM_FALLBACK_TIMEOUT", "60"))
         session = await self._get_session()
-        t0 = time.time()
-        max_retries = 5
+
+        # Two-stage ChatGPT attempt: first gpt-5.6-sol, then original client model
+        models_to_try = [CHATGPT_MODEL_SLUG]
+        if original_client_model != CHATGPT_MODEL_SLUG:
+            models_to_try.append(original_client_model)
+
         timed_out = False
-        for attempt in range(max_retries):
-            try:
-                upstream = await _asyncio.wait_for(
-                    session.post(url, json=forwarded, headers=headers),
-                    timeout=FALLBACK_TIMEOUT,
-                )
-            except _asyncio.TimeoutError:
-                elapsed = time.time() - t0
-                print(f"\n{'='*60}", flush=True)
-                print(f"[shim] ⚠️  ChatGPT TIMEOUT after {elapsed:.1f}s, switching to OpenAI API fallback", flush=True)
-                print(f"{'='*60}\n", flush=True)
-                timed_out = True
-                break
-            except (ClientConnectorError, ServerDisconnectedError, ClientOSError, ConnectionResetError) as e:
-                if attempt < max_retries - 1:
-                    print(f"[shim] connection error, resetting session (attempt {attempt+1}): {e}", flush=True)
-                    session = await self._reset_session()
-                    await _asyncio.sleep(1)
-                    t0 = time.time()
-                    continue
-                raise
-            t1 = time.time()
-            print(f"[shim] POST /codex/responses status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1}", flush=True)
-            if upstream.status in (429, 503, 529):
-                body_text = await upstream.text()
-                # usage_limit_reached is a hard limit, no point retrying
-                if "usage_limit_reached" in body_text:
+        for model_idx, try_model in enumerate(models_to_try):
+            forwarded["model"] = try_model
+            t0 = time.time()
+            max_retries = 5
+            model_failed = False
+            upstream = None
+            for attempt in range(max_retries):
+                try:
+                    upstream = await _asyncio.wait_for(
+                        session.post(url, json=forwarded, headers=headers),
+                        timeout=FALLBACK_TIMEOUT,
+                    )
+                except _asyncio.TimeoutError:
+                    elapsed = time.time() - t0
                     print(f"\n{'='*60}", flush=True)
-                    print(f"[shim] ⚠️  ChatGPT USAGE LIMIT REACHED, immediately switching to OpenAI API fallback", flush=True)
+                    print(f"[shim] ⚠️  ChatGPT TIMEOUT ({try_model}) after {elapsed:.1f}s", flush=True)
                     print(f"{'='*60}\n", flush=True)
-                    timed_out = True
+                    model_failed = True
                     break
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt + 1
-                    print(f"[shim] retrying in {wait}s: {body_text[:200]}", flush=True)
-                    await _asyncio.sleep(wait)
-                    t0 = time.time()
-                    continue
-                # Last attempt still rate-limited, fallback
-                print(f"\n{'='*60}", flush=True)
-                print(f"[shim] ⚠️  ChatGPT RATE-LIMITED after {max_retries} attempts, switching to OpenAI API fallback", flush=True)
-                print(f"{'='*60}\n", flush=True)
-                timed_out = True
+                except (ClientConnectorError, ServerDisconnectedError, ClientOSError, ConnectionResetError) as e:
+                    if attempt < max_retries - 1:
+                        print(f"[shim] connection error, resetting session (attempt {attempt+1}): {e}", flush=True)
+                        session = await self._reset_session()
+                        await _asyncio.sleep(1)
+                        t0 = time.time()
+                        continue
+                    model_failed = True
+                    break
+                t1 = time.time()
+                print(f"[shim] POST /codex/responses status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1} model={try_model}", flush=True)
+                if upstream.status in (429, 503, 529):
+                    body_text = await upstream.text()
+                    # usage_limit_reached is a hard limit for this model
+                    if "usage_limit_reached" in body_text:
+                        print(f"\n{'='*60}", flush=True)
+                        print(f"[shim] ⚠️  ChatGPT USAGE LIMIT REACHED for {try_model}", flush=True)
+                        print(f"{'='*60}\n", flush=True)
+                        model_failed = True
+                        break
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt + 1
+                        print(f"[shim] retrying in {wait}s: {body_text[:200]}", flush=True)
+                        await _asyncio.sleep(wait)
+                        t0 = time.time()
+                        continue
+                    # Last attempt still rate-limited
+                    print(f"\n{'='*60}", flush=True)
+                    print(f"[shim] ⚠️  ChatGPT RATE-LIMITED after {max_retries} attempts for {try_model}", flush=True)
+                    print(f"{'='*60}\n", flush=True)
+                    model_failed = True
+                    break
+                if upstream.status >= 400:
+                    err_text = await upstream.text()
+                    print(f"\n{'='*60}", flush=True)
+                    print(f"[shim] ⚠️  ChatGPT FAILED (status {upstream.status}) for {try_model}", flush=True)
+                    print(f"[shim] Error: {err_text[:150]}", flush=True)
+                    print(f"{'='*60}\n", flush=True)
+                    model_failed = True
+                    break
                 break
-            if upstream.status >= 400:
-                err_text = await upstream.text()
-                print(f"\n{'='*60}", flush=True)
-                print(f"[shim] ⚠️  ChatGPT FAILED (status {upstream.status}), switching to OpenAI API fallback", flush=True)
-                print(f"[shim] Error: {err_text[:150]}", flush=True)
-                print(f"{'='*60}\n", flush=True)
-                timed_out = True
-                break
-            break
+
+            if not model_failed:
+                break  # Success, proceed with streaming
+            # If this model failed but there's another to try, continue loop
+            if model_idx < len(models_to_try) - 1:
+                print(f"[shim] Trying next model: {models_to_try[model_idx + 1]}", flush=True)
+                continue
+            # All ChatGPT models exhausted, fallback to OpenAI API
+            print(f"[shim] All ChatGPT models exhausted, trying Claude gateway", flush=True)
+            timed_out = True
 
         if timed_out:
+            claude_result = await self._claude_gateway_fallback(request, body, response_model_override)
+            if claude_result is not None:
+                return claude_result
+            print(f"[shim] Claude gateway also failed, switching to OpenAI API fallback", flush=True)
             return await self._openai_api_fallback(request, body, response_model_override)
+
+
 
         if not forwarded.get("stream"):
             payload = await upstream.json(content_type=None)
@@ -738,6 +766,93 @@ class ShimServer:
             pass
         return response
 
+    async def _claude_gateway_fallback(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        response_model_override: str | None = None,
+    ) -> web.StreamResponse | None:
+        """Fallback to Claude via kiro-gateway (localhost:8000). Returns None if fails."""
+        CLAUDE_URL = "http://127.0.0.1:8000/v1/chat/completions"
+        CLAUDE_KEY = "my-super-secret-password-123"
+        CLAUDE_MODEL = "claude-sonnet-4"
+
+        chat_body = responses_to_chat(body, CLAUDE_MODEL)
+        chat_body["stream"] = True
+        if not chat_body.get("tools") and "parallel_tool_calls" in chat_body:
+            del chat_body["parallel_tool_calls"]
+
+        headers = {
+            "Authorization": f"Bearer {CLAUDE_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        session = await self._get_session()
+        t0 = time.time()
+        try:
+            import asyncio as _asyncio
+            upstream = await _asyncio.wait_for(
+                session.post(CLAUDE_URL, json=chat_body, headers=headers),
+                timeout=90,
+            )
+        except Exception as e:
+            print(f"[shim] Claude gateway failed: {e}", flush=True)
+            return None
+
+        t1 = time.time()
+        print(f"[shim] CLAUDE gateway status={upstream.status} elapsed={t1-t0:.2f}s model={CLAUDE_MODEL}", flush=True)
+
+        if upstream.status >= 400:
+            err_text = await upstream.text()
+            print(f"[shim] Claude gateway error: {err_text[:300]}", flush=True)
+            return None
+
+        # Stream SSE back using ResponsesStreamState
+        response = _sse_response()
+        await response.prepare(request)
+
+        model_name = response_model_override or "claude-sonnet-4"
+        tool_types = _build_tool_types(body)
+        state = ResponsesStreamState(model_name, tool_types)
+
+        chunk_count = 0
+        source_injected = False
+        try:
+            await state.start(response)
+            async for line in _sse_lines(upstream):
+                if line == "[DONE]":
+                    print(f"[shim] CLAUDE stream done, chunks={chunk_count} content_len={len(state.message_text)}", flush=True)
+                    break
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                if chunk_count == 0:
+                    print(f"[shim] CLAUDE first delta keys: {list(delta.keys())} finish_reason={choices[0].get('finish_reason')}", flush=True)
+                chunk_count += 1
+                if not source_injected and delta.get("content"):
+                    source_injected = True
+                    await state.write_chat_delta(
+                        response,
+                        {"choices": [{"delta": {"content": "[Claude] "}}]},
+                    )
+                await state.write_chat_delta(response, chunk)
+            await state.finish(response)
+        except ClientDisconnected:
+            pass
+        finally:
+            upstream.release()
+
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
+
     async def _openai_api_fallback(
         self,
         request: web.Request,
@@ -850,8 +965,8 @@ class ShimServer:
         if not access_token:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
-        original_model = str(forwarded.get("model") or "")
-        forwarded["model"] = CHATGPT_MODEL_SLUG  # Always force configured model for ChatGPT passthrough
+        original_model = str(forwarded.get("model") or "gpt-5.5")
+        forwarded["model"] = CHATGPT_MODEL_SLUG  # First try: configured model (gpt-5.6-sol)
         forwarded.pop("stream", None)
         forwarded.pop("store", None)
         headers = {
@@ -867,38 +982,65 @@ class ShimServer:
         import asyncio as _asyncio
         from aiohttp import ClientConnectorError, ServerDisconnectedError, ClientOSError
         session = await self._get_session()
-        t0 = time.time()
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                upstream = await session.post(url, json=forwarded, headers=headers)
-            except (ClientConnectorError, ServerDisconnectedError, ClientOSError, ConnectionResetError) as e:
-                if attempt < max_retries - 1:
-                    print(f"[shim] compact connection error, resetting session (attempt {attempt+1}): {e}", flush=True)
-                    session = await self._reset_session()
-                    await _asyncio.sleep(1)
-                    t0 = time.time()
-                    continue
-                raise
-            t1 = time.time()
-            print(f"[shim] POST /codex/responses/compact status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1}", flush=True)
-            if upstream.status in (429, 503, 529):
-                body_text = await upstream.text()
-                # usage_limit_reached is a hard limit, no point retrying
-                if "usage_limit_reached" in body_text:
-                    print(f"\n{'='*60}", flush=True)
-                    print(f"[shim] ⚠️  ChatGPT USAGE LIMIT REACHED, immediately switching to OpenAI API fallback", flush=True)
-                    print(f"{'='*60}\n", flush=True)
-                    timed_out = True
+
+        # Two-stage ChatGPT attempt: first gpt-5.6-sol, then original client model
+        models_to_try = [CHATGPT_MODEL_SLUG]
+        if original_model != CHATGPT_MODEL_SLUG:
+            models_to_try.append(original_model)
+
+        for model_idx, try_model in enumerate(models_to_try):
+            forwarded["model"] = try_model
+            t0 = time.time()
+            max_retries = 5
+            model_failed = False
+            upstream = None
+            for attempt in range(max_retries):
+                try:
+                    upstream = await session.post(url, json=forwarded, headers=headers)
+                except (ClientConnectorError, ServerDisconnectedError, ClientOSError, ConnectionResetError) as e:
+                    if attempt < max_retries - 1:
+                        print(f"[shim] compact connection error, resetting session (attempt {attempt+1}): {e}", flush=True)
+                        session = await self._reset_session()
+                        await _asyncio.sleep(1)
+                        t0 = time.time()
+                        continue
+                    model_failed = True
                     break
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt + 1
-                    print(f"[shim] retrying in {wait}s: {body_text[:200]}", flush=True)
-                    await _asyncio.sleep(wait)
-                    t0 = time.time()
-                    continue
-            if upstream.status >= 400:
+                t1 = time.time()
+                print(f"[shim] POST /codex/responses/compact status={upstream.status} elapsed={t1-t0:.2f}s attempt={attempt+1} model={try_model}", flush=True)
+                if upstream.status in (429, 503, 529):
+                    body_text = await upstream.text()
+                    if "usage_limit_reached" in body_text:
+                        print(f"\n{'='*60}", flush=True)
+                        print(f"[shim] ⚠️  ChatGPT USAGE LIMIT REACHED for {try_model} (compact)", flush=True)
+                        print(f"{'='*60}\n", flush=True)
+                        model_failed = True
+                        break
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt + 1
+                        print(f"[shim] retrying in {wait}s: {body_text[:200]}", flush=True)
+                        await _asyncio.sleep(wait)
+                        t0 = time.time()
+                        continue
+                    model_failed = True
+                    break
+                if upstream.status >= 400:
+                    if model_idx < len(models_to_try) - 1:
+                        model_failed = True
+                        break
+                    return await _error_response(upstream)
+                break
+
+            if not model_failed:
+                break
+            if model_idx < len(models_to_try) - 1:
+                print(f"[shim] compact: trying next model: {models_to_try[model_idx + 1]}", flush=True)
+                continue
+            # All models exhausted — return last error
+            if upstream:
                 return await _error_response(upstream)
+            raise web.HTTPBadGateway(text="All ChatGPT models failed (compact)")
+
         payload = await upstream.json(content_type=None)
         _rewrite_response_model(payload, original_model or None)
         return web.json_response(payload)
