@@ -689,11 +689,69 @@ class ShimServer:
 
             if stream_error_detected:
                 upstream.release()
+                error_line = buffered_lines[-1] if buffered_lines else ""
                 print(f"\n{'='*60}", flush=True)
-                print(f"[shim] ⚠️  ChatGPT in-stream ERROR detected, switching to OpenAI API fallback", flush=True)
-                print(f"[shim] Trigger: {buffered_lines[-1][:200]}", flush=True)
+                print(f"[shim] ⚠️  ChatGPT in-stream ERROR detected for {try_model}", flush=True)
+                print(f"[shim] Trigger: {error_line[:200]}", flush=True)
                 print(f"{'='*60}\n", flush=True)
-                return await self._openai_api_fallback(request, body, response_model_override)
+                # Check for "at capacity" and add fallback models
+                if "at capacity" in error_line.lower() and not capacity_fallbacks_added:
+                    capacity_fallbacks_added = True
+                    for fb_model in ("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"):
+                        if fb_model not in models_to_try:
+                            models_to_try.append(fb_model)
+                    print(f"[shim] Model at capacity, added fallbacks: {models_to_try}", flush=True)
+                # Try next model if available
+                model_idx += 1
+                if model_idx < len(models_to_try):
+                    print(f"[shim] Trying next model: {models_to_try[model_idx]}", flush=True)
+                    forwarded["model"] = models_to_try[model_idx]
+                    try_model = models_to_try[model_idx]
+                    # Reset and retry with new model
+                    session = await self._get_session()
+                    upstream = await _asyncio.wait_for(
+                        session.post(url, json=forwarded, headers=headers),
+                        timeout=FALLBACK_TIMEOUT,
+                    )
+                    if upstream.status == 200:
+                        # Re-run stream buffering for new model
+                        buffered_lines = []
+                        stream_error_detected = False
+                        lines_iter = _sse_lines(upstream)
+                        for _ in range(30):
+                            try:
+                                line = await _asyncio.wait_for(anext(lines_iter, _sentinel), timeout=15)  # type: ignore[arg-type]
+                            except _asyncio.TimeoutError:
+                                break
+                            if line is _sentinel:
+                                break
+                            line = str(line)  # type cast for pyright
+                            buffered_lines.append(line)
+                            if line == "[DONE]":
+                                break
+                            if _stream_has_error(line):
+                                stream_error_detected = True
+                                break
+                            if '"output_text.delta"' in line or '"response.output_item.added"' in line:
+                                break
+                        if stream_error_detected:
+                            # Recursively handle - but for simplicity, fall through to Claude
+                            upstream.release()
+                            print(f"[shim] Fallback model {try_model} also had stream error, trying Claude gateway", flush=True)
+                        else:
+                            # Success with fallback model - continue to streaming below
+                            pass
+                    else:
+                        print(f"[shim] Fallback model {try_model} returned status {upstream.status}", flush=True)
+                        stream_error_detected = True
+                
+                if stream_error_detected:
+                    # All models failed, try Claude gateway
+                    claude_result = await self._claude_gateway_fallback(request, body, response_model_override)
+                    if claude_result is not None:
+                        return claude_result
+                    print(f"[shim] Claude gateway also failed, switching to OpenAI API fallback", flush=True)
+                    return await self._openai_api_fallback(request, body, response_model_override)
 
             # No error — prepare response and flush buffered lines
             response = _sse_response()
@@ -755,13 +813,58 @@ class ShimServer:
             except (_asyncio.TimeoutError, Exception):
                 pass
 
-            if first_chunk and _stream_has_error(first_chunk.decode("utf-8", errors="replace")):
+            first_chunk_text = first_chunk.decode("utf-8", errors="replace") if first_chunk else ""
+            if first_chunk and _stream_has_error(first_chunk_text):
                 upstream.release()
                 print(f"\n{'='*60}", flush=True)
-                print(f"[shim] ⚠️  ChatGPT in-stream ERROR detected (raw), switching to OpenAI API fallback", flush=True)
-                print(f"[shim] Trigger: {first_chunk.decode('utf-8', errors='replace')[:200]}", flush=True)
+                print(f"[shim] ⚠️  ChatGPT in-stream ERROR detected (raw) for {try_model}", flush=True)
+                print(f"[shim] Trigger: {first_chunk_text[:200]}", flush=True)
                 print(f"{'='*60}\n", flush=True)
-                return await self._openai_api_fallback(request, body, response_model_override)
+                
+                # Check for "at capacity" and try fallback models
+                if "at capacity" in first_chunk_text.lower() and not capacity_fallbacks_added:
+                    capacity_fallbacks_added = True
+                    for fb_model in ("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"):
+                        if fb_model not in models_to_try:
+                            models_to_try.append(fb_model)
+                    print(f"[shim] Model at capacity (raw), added fallbacks: {models_to_try}", flush=True)
+                
+                # Try next model if available
+                model_idx += 1
+                if model_idx < len(models_to_try):
+                    print(f"[shim] Trying next model (raw): {models_to_try[model_idx]}", flush=True)
+                    forwarded["model"] = models_to_try[model_idx]
+                    try_model = models_to_try[model_idx]
+                    session = await self._get_session()
+                    try:
+                        upstream = await _asyncio.wait_for(
+                            session.post(url, json=forwarded, headers=headers),
+                            timeout=FALLBACK_TIMEOUT,
+                        )
+                        if upstream.status == 200:
+                            first_chunk = await _asyncio.wait_for(upstream.content.read(4096), timeout=10)
+                            first_chunk_text = first_chunk.decode("utf-8", errors="replace") if first_chunk else ""
+                            if not _stream_has_error(first_chunk_text):
+                                # Success - continue to streaming below
+                                pass
+                            else:
+                                upstream.release()
+                                print(f"[shim] Fallback model {try_model} also had error (raw), trying Claude gateway", flush=True)
+                                first_chunk = b""  # Signal to fall through to Claude
+                        else:
+                            print(f"[shim] Fallback model {try_model} returned status {upstream.status} (raw)", flush=True)
+                            first_chunk = b""
+                    except Exception as e:
+                        print(f"[shim] Fallback model {try_model} failed (raw): {e}", flush=True)
+                        first_chunk = b""
+                
+                if not first_chunk:
+                    # All models failed, try Claude gateway
+                    claude_result = await self._claude_gateway_fallback(request, body, response_model_override)
+                    if claude_result is not None:
+                        return claude_result
+                    print(f"[shim] Claude gateway also failed (raw), switching to OpenAI API fallback", flush=True)
+                    return await self._openai_api_fallback(request, body, response_model_override)
 
             response = _sse_response()
             await response.prepare(request)
