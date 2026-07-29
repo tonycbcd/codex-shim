@@ -542,12 +542,17 @@ class ShimServer:
         session = await self._get_session()
 
         # Two-stage ChatGPT attempt: first gpt-5.6-sol, then original client model
+        # Fallback models will be added dynamically if "at capacity" error is detected
         models_to_try = [CHATGPT_MODEL_SLUG]
         if original_client_model != CHATGPT_MODEL_SLUG:
             models_to_try.append(original_client_model)
+        capacity_fallbacks_added = False
 
         timed_out = False
-        for model_idx, try_model in enumerate(models_to_try):
+        model_idx = 0
+        try_model = models_to_try[0]  # Initialize for type checker
+        while model_idx < len(models_to_try):
+            try_model = models_to_try[model_idx]
             forwarded["model"] = try_model
             t0 = time.time()
             max_retries = 5
@@ -604,6 +609,13 @@ class ShimServer:
                     print(f"[shim] ⚠️  ChatGPT FAILED (status {upstream.status}) for {try_model}", flush=True)
                     print(f"[shim] Error: {err_text[:150]}", flush=True)
                     print(f"{'='*60}\n", flush=True)
+                    # Check for "at capacity" error and add limited fallback models (up to gpt-5.3-codex)
+                    if "at capacity" in err_text.lower() and not capacity_fallbacks_added:
+                        capacity_fallbacks_added = True
+                        for fb_model in ("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"):
+                            if fb_model not in models_to_try:
+                                models_to_try.append(fb_model)
+                        print(f"[shim] Model at capacity, added fallbacks: {models_to_try}", flush=True)
                     model_failed = True
                     break
                 break
@@ -611,8 +623,9 @@ class ShimServer:
             if not model_failed:
                 break  # Success, proceed with streaming
             # If this model failed but there's another to try, continue loop
-            if model_idx < len(models_to_try) - 1:
-                print(f"[shim] Trying next model: {models_to_try[model_idx + 1]}", flush=True)
+            model_idx += 1
+            if model_idx < len(models_to_try):
+                print(f"[shim] Trying next model: {models_to_try[model_idx]}", flush=True)
                 continue
             # All ChatGPT models exhausted, fallback to OpenAI API
             print(f"[shim] All ChatGPT models exhausted, trying Claude gateway", flush=True)
@@ -686,6 +699,8 @@ class ShimServer:
             response = _sse_response()
             await response.prepare(request)
             _source_injected = False
+            # Determine source tag: show model name if using a fallback
+            _source_tag = "[ChatGPT]" if try_model == CHATGPT_MODEL_SLUG else f"[ChatGPT {try_model}]"
             try:
                 for line in buffered_lines:
                     if line == "[DONE]":
@@ -696,11 +711,11 @@ class ShimServer:
                     except json.JSONDecodeError:
                         await _safe_write(response, f"data: {line}\n\n".encode())
                         continue
-                    # Inject [ChatGPT] before first content delta
+                    # Inject source tag before first content delta
                     if not _source_injected and payload.get("type") == "response.output_text.delta":
                         _source_injected = True
                         source_evt = dict(payload)
-                        source_evt["delta"] = "[ChatGPT] "
+                        source_evt["delta"] = f"{_source_tag} "
                         await _write_sse(response, source_evt)
                     _rewrite_response_model(payload, response_model_override)
                     await _write_sse(response, payload)
@@ -718,11 +733,11 @@ class ShimServer:
                         except json.JSONDecodeError:
                             await _safe_write(response, f"data: {line}\n\n".encode())
                             continue
-                        # Inject [ChatGPT] before first content delta
+                        # Inject source tag before first content delta
                         if not _source_injected and payload.get("type") == "response.output_text.delta":
                             _source_injected = True
                             source_evt = dict(payload)
-                            source_evt["delta"] = "[ChatGPT] "
+                            source_evt["delta"] = f"{_source_tag} "
                             await _write_sse(response, source_evt)
                         _rewrite_response_model(payload, response_model_override)
                         await _write_sse(response, payload)
@@ -775,7 +790,7 @@ class ShimServer:
         """Fallback to Claude via kiro-gateway (localhost:8000). Returns None if fails."""
         CLAUDE_URL = "http://127.0.0.1:8000/v1/chat/completions"
         CLAUDE_KEY = "my-super-secret-password-123"
-        CLAUDE_MODEL = "claude-opus-4.6"
+        CLAUDE_MODEL = "claude-opus-4.5"
 
         chat_body = responses_to_chat(body, CLAUDE_MODEL)
         chat_body["stream"] = True
@@ -984,11 +999,15 @@ class ShimServer:
         session = await self._get_session()
 
         # Two-stage ChatGPT attempt: first gpt-5.6-sol, then original client model
+        # Fallback models will be added dynamically if "at capacity" error is detected
         models_to_try = [CHATGPT_MODEL_SLUG]
         if original_model != CHATGPT_MODEL_SLUG:
             models_to_try.append(original_model)
+        capacity_fallbacks_added = False
 
-        for model_idx, try_model in enumerate(models_to_try):
+        model_idx = 0
+        while model_idx < len(models_to_try):
+            try_model = models_to_try[model_idx]
             forwarded["model"] = try_model
             t0 = time.time()
             max_retries = 5
@@ -1025,16 +1044,23 @@ class ShimServer:
                     model_failed = True
                     break
                 if upstream.status >= 400:
-                    if model_idx < len(models_to_try) - 1:
-                        model_failed = True
-                        break
-                    return await _error_response(upstream)
+                    err_text = await upstream.text()
+                    # Check for "at capacity" error and add limited fallback models (up to gpt-5.3-codex)
+                    if "at capacity" in err_text.lower() and not capacity_fallbacks_added:
+                        capacity_fallbacks_added = True
+                        for fb_model in ("gpt-5.5", "gpt-5.4", "gpt-5.3-codex"):
+                            if fb_model not in models_to_try:
+                                models_to_try.append(fb_model)
+                        print(f"[shim] compact: Model at capacity, added fallbacks: {models_to_try}", flush=True)
+                    model_failed = True
+                    break
                 break
 
             if not model_failed:
                 break
-            if model_idx < len(models_to_try) - 1:
-                print(f"[shim] compact: trying next model: {models_to_try[model_idx + 1]}", flush=True)
+            model_idx += 1
+            if model_idx < len(models_to_try):
+                print(f"[shim] compact: trying next model: {models_to_try[model_idx]}", flush=True)
                 continue
             # All models exhausted — return last error
             if upstream:
