@@ -8,6 +8,24 @@ from typing import Any
 THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
+
+
+def _normalize_tool_call_id(call_id: str | None) -> str:
+    """Normalize tool call IDs to ChatGPT-compatible format.
+    
+    Claude generates IDs like 'tooluse_Y27l3t7MM3Nab7hS85mO8x' but ChatGPT
+    only accepts IDs starting with 'fc'. This converts incompatible IDs.
+    """
+    if not call_id:
+        return "fc_0"
+    # Convert Claude's tooluse_ prefix to fc_
+    if call_id.startswith("tooluse_"):
+        return "fc_" + call_id[8:]  # Strip 'tooluse_' and add 'fc_'
+    # Convert toolu_ prefix (another Claude format) to fc_
+    if call_id.startswith("toolu_"):
+        return "fc_" + call_id[6:]
+    # All other formats - pass through unchanged
+    return call_id
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
 
 
@@ -487,7 +505,7 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
             # Coalesce consecutive function_call items into a single assistant
             # message with multiple tool_calls so chat-completions upstreams
             # accept the subsequent tool messages.
-            call_id = item.get("call_id") or item.get("id") or "call_0"
+            call_id = _normalize_tool_call_id(item.get("call_id") or item.get("id"))
             pending_tool_calls.append(
                 {
                     "id": call_id,
@@ -501,7 +519,8 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
         elif item_type == "function_call_output":
             flush_pending_assistant_tool_calls()
             output = item.get("output", "")
-            messages.append({"role": "tool", "tool_call_id": item.get("call_id"), "content": _content_to_text(output)})
+            call_id = _normalize_tool_call_id(item.get("call_id"))
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": _content_to_text(output)})
             if _has_visual_content(output):
                 messages.append({"role": "user", "content": _visual_feedback_chat_content(output, item.get("call_id"))})
         elif item_type == "reasoning":

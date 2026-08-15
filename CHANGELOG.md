@@ -9,6 +9,13 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- `first_platform` request parameter for `/v1/responses` and `/v1/responses/compact`.
+  By default (empty/unset), the shim skips ChatGPT and routes directly to the
+  Claude gateway for faster responses. Set `first_platform: "ChatGPT"` to try
+  ChatGPT passthrough first before falling back to Claude/OpenAI API.
+- `[chatgpt]` input prefix trigger: prefix your message with `[chatgpt]` in Codex
+  to use ChatGPT first (equivalent to `first_platform: "ChatGPT"`). The prefix is
+  case-insensitive and automatically stripped before sending to upstream APIs.
 - `codex-shim doctor`, a read-only local diagnostics command covering Python,
   dependencies, Codex CLI availability, settings, runtime files, daemon health,
   passthrough readiness, proxy loopback bypass, and Codex config wiring with

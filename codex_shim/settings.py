@@ -17,6 +17,7 @@ DEFAULT_PORT = 8765
 PROVIDER_NAME = "codex_shim"
 CHATGPT_MODEL_SLUG = "gpt-5.6-sol"
 FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
+    "gpt-5.6-sol",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
@@ -72,9 +73,9 @@ def _minimal_chatgpt_passthrough_entry(slug: str, display_name: str) -> dict[str
         "slug": slug,
         "display_name": display_name,
         "description": f"OpenAI {display_name} routed through ChatGPT passthrough.",
-        "context_window": 400000,
-        "max_context_window": 400000,
-        "auto_compact_token_limit": 320000,
+        "context_window": 200000,
+        "max_context_window": 200000,
+        "auto_compact_token_limit": 160000,
         "truncation_policy": {"mode": "tokens", "limit": 64000},
         "default_reasoning_level": "medium",
         "supported_reasoning_levels": [

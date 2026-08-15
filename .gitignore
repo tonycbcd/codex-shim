@@ -1,5 +1,7 @@
 # Generated runtime + user state
 .codex-shim/
+.deepseek-web-data/
+vendor/deepseek-web-api/node_modules/
 *.log
 *.pid
 
@@ -26,3 +28,5 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+vendor/
+data/

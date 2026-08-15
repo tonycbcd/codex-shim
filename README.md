@@ -574,6 +574,41 @@ codex-model gpt-5.5
 Older local configs or notes may refer to `openai-gpt-5-5`; the server accepts
 that prefix as an alias and routes it to the same passthrough.
 
+### `first_platform` parameter
+
+By default, the shim **skips ChatGPT** and routes directly to the Claude gateway
+(kiro-gateway) for faster response times and to avoid ChatGPT rate limits. If
+Claude fails, it falls back to OpenAI API.
+
+To explicitly try ChatGPT first, you have two options:
+
+**Option 1:** Add `first_platform: "ChatGPT"` to your request:
+
+```json
+{
+  "model": "gpt-5.6-sol",
+  "input": [{"role": "user", "content": "hello"}],
+  "first_platform": "ChatGPT"
+}
+```
+
+**Option 2:** Prefix your message with `[chatgpt]` in Codex:
+
+```
+[chatgpt] explain this code
+```
+
+The prefix is case-insensitive and automatically stripped before sending to the
+upstream API.
+
+| Trigger | Routing behavior |
+|---------|------------------|
+| No prefix, no `first_platform` (default) | Claude gateway → OpenAI API fallback |
+| `[chatgpt]` prefix in input | ChatGPT passthrough → Claude → OpenAI API |
+| `first_platform: "ChatGPT"` | ChatGPT passthrough → Claude → OpenAI API |
+
+Both `first_platform` and `[chatgpt]` prefix are stripped before forwarding to upstream APIs.
+
 ---
 
 ## Cursor/Composer passthrough (subscription)

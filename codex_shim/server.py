@@ -60,6 +60,12 @@ from .translate import (
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
+# DeepSeek Web API configuration
+DEEPSEEK_API_BASE = "http://127.0.0.1:8766"
+DEEPSEEK_API_KEY_FILE = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / ".api-key"
+DEEPSEEK_MODEL_STANDARD = "deepseek-v4-flash"
+DEEPSEEK_MODEL_PRO = "deepseek-v4-pro"
+
 
 
 class ShimServer:
@@ -265,6 +271,32 @@ class ShimServer:
         body = await request.json()
         _log_incoming_request("/v1/responses", body)
         body = await self._maybe_apply_auto_router(body)
+        # Prefer an explicit prefix in the newest user message. The patched
+        # Codex client may instead send the same choice as first_platform.
+        body, prefix_platform = _check_and_strip_platform_prefix(body)
+        requested_platform = str(body.pop("first_platform", "") or "").strip().lower()
+        # first_platform is an explicit per-request routing decision and must
+        # override prefixes retained in older conversation history.
+        platform = requested_platform or prefix_platform or None
+        if platform:
+            print(f"[shim] Platform prefix detected: [{platform}]", flush=True)
+            if platform == "deepseek":
+                if _deepseek_available():
+                    body["model"] = DEEPSEEK_MODEL_STANDARD
+                    return await self._deepseek_passthrough(request, body, "/v1/responses")
+                else:
+                    print("[shim] ⚠️  DeepSeek not available, falling back to Claude", flush=True)
+            elif platform == "deepseek-pro":
+                if _deepseek_available():
+                    body["model"] = DEEPSEEK_MODEL_PRO
+                    return await self._deepseek_passthrough(request, body, "/v1/responses")
+                else:
+                    print("[shim] ⚠️  DeepSeek not available, falling back to Claude", flush=True)
+            elif platform == "chatgpt":
+                if chatgpt_passthrough_available():
+                    return await self._chatgpt_passthrough(request, body)
+                else:
+                    print("[shim] ⚠️  ChatGPT not available, falling back to Claude", flush=True)
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model) and chatgpt_passthrough_available():
             upstream = chatgpt_upstream_model(model)
@@ -744,7 +776,7 @@ class ShimServer:
                     else:
                         print(f"[shim] Fallback model {try_model} returned status {upstream.status}", flush=True)
                         stream_error_detected = True
-                
+
                 if stream_error_detected:
                     # All models failed, try Claude gateway
                     claude_result = await self._claude_gateway_fallback(request, body, response_model_override)
@@ -820,7 +852,7 @@ class ShimServer:
                 print(f"[shim] ⚠️  ChatGPT in-stream ERROR detected (raw) for {try_model}", flush=True)
                 print(f"[shim] Trigger: {first_chunk_text[:200]}", flush=True)
                 print(f"{'='*60}\n", flush=True)
-                
+
                 # Check for "at capacity" and try fallback models
                 if "at capacity" in first_chunk_text.lower() and not capacity_fallbacks_added:
                     capacity_fallbacks_added = True
@@ -828,7 +860,7 @@ class ShimServer:
                         if fb_model not in models_to_try:
                             models_to_try.append(fb_model)
                     print(f"[shim] Model at capacity (raw), added fallbacks: {models_to_try}", flush=True)
-                
+
                 # Try next model if available
                 model_idx += 1
                 if model_idx < len(models_to_try):
@@ -857,7 +889,7 @@ class ShimServer:
                     except Exception as e:
                         print(f"[shim] Fallback model {try_model} failed (raw): {e}", flush=True)
                         first_chunk = b""
-                
+
                 if not first_chunk:
                     # All models failed, try Claude gateway
                     claude_result = await self._claude_gateway_fallback(request, body, response_model_override)
@@ -884,6 +916,165 @@ class ShimServer:
             pass
         return response
 
+
+    @staticmethod
+    def _is_malformed_tool_call(text: str) -> bool:
+        """Detect XML-like pseudo tool calls emitted as plain model text."""
+        return bool(
+            re.search(
+                r"<\s*(?:_?calls?|tool_?calls?|invoke|parameter)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    async def _deepseek_passthrough(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        path: str = "/v1/responses",
+    ) -> web.StreamResponse:
+        """Forward a Responses request to DeepSeek Web API.
+
+        deepseek-web-api emulates function calling by prompting DeepSeek with
+        the available tool definitions, parsing its XML/JSON protocol, and
+        returning standard OpenAI ``tool_calls`` deltas. Tools must therefore
+        be preserved here rather than stripped.
+        """
+        api_key = _get_deepseek_api_key()
+        if not api_key:
+            print("[shim] ⚠️  DeepSeek API key not found, falling back to Claude", flush=True)
+            return await self._claude_gateway_fallback(request, body, response_model_override="deepseek") or \
+                   await self._openai_api_fallback(request, body, response_model_override="deepseek")
+
+        use_pro = str(body.get("model") or "").lower() == DEEPSEEK_MODEL_PRO
+        ds_model = DEEPSEEK_MODEL_PRO if use_pro else DEEPSEEK_MODEL_STANDARD
+        source_tag = "[deepseek-pro]" if use_pro else "[deepseek]"
+
+        tools = body.get("tools")
+        if tools:
+            print(
+                f"[shim] DeepSeek: forwarding {len(tools)} tools through compatibility parser",
+                flush=True,
+            )
+
+        # Convert to chat completions format
+        forwarded_body = _sanitize_deepseek_body(body)
+        chat_body = responses_to_chat(forwarded_body, ds_model)
+        chat_body["stream"] = body.get("stream", True)
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        del path  # Reserved for parity with other passthrough handlers.
+        url = f"{DEEPSEEK_API_BASE}/v1/chat/completions"
+        session = await self._get_session()
+        t0 = time.time()
+
+        import asyncio as _asyncio
+        try:
+            upstream = await _asyncio.wait_for(
+                session.post(url, json=chat_body, headers=headers),
+                timeout=120,
+            )
+        except _asyncio.TimeoutError:
+            print(f"[shim] ⚠️  DeepSeek TIMEOUT after 120s, falling back to Claude", flush=True)
+            return await self._claude_gateway_fallback(request, body, response_model_override="deepseek") or \
+                   await self._openai_api_fallback(request, body, response_model_override="deepseek")
+        except Exception as e:
+            print(f"[shim] ⚠️  DeepSeek connection error: {e}, falling back to Claude", flush=True)
+            return await self._claude_gateway_fallback(request, body, response_model_override="deepseek") or \
+                   await self._openai_api_fallback(request, body, response_model_override="deepseek")
+
+        t1 = time.time()
+        print(f"[shim] DeepSeek status={upstream.status} elapsed={t1-t0:.2f}s model={ds_model}", flush=True)
+
+        if upstream.status >= 400:
+            err_text = await upstream.text()
+            print(f"[shim] ⚠️  DeepSeek error: {err_text[:300]}, falling back to Claude", flush=True)
+            return await self._claude_gateway_fallback(request, body, response_model_override="deepseek") or \
+                   await self._openai_api_fallback(request, body, response_model_override="deepseek")
+
+        # Handle streaming response
+        if chat_body.get("stream"):
+            response = _sse_response()
+            await response.prepare(request)
+
+            model_name = "deepseek-pro" if use_pro else "deepseek"
+            tool_types = _build_tool_types(body)
+            state = ResponsesStreamState(model_name, tool_types)
+
+            chunk_count = 0
+            source_injected = False
+            try:
+                await state.start(response)
+                async for line in _sse_lines(upstream):
+                    if line == "[DONE]":
+                        print(f"[shim] DeepSeek stream done, chunks={chunk_count} content_len={len(state.message_text)}", flush=True)
+                        break
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk_count += 1
+
+                    # Extract delta content
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content") or ""
+
+                    # Inject source tag before first content.
+                    if content and not source_injected:
+                        source_injected = True
+                        delta["content"] = f"{source_tag} {content}"
+
+                    await state.write_chat_delta(response, chunk)
+
+                await state.finish(response)
+            except Exception as e:
+                print(f"[shim] DeepSeek stream error: {e}", flush=True)
+            finally:
+                upstream.release()
+
+            return response
+
+        # Handle non-streaming response
+        payload = await upstream.json(content_type=None)
+        choices = payload.get("choices") or []
+        content = ""
+        if choices:
+            message = choices[0].get("message") or {}
+            content = message.get("content") or ""
+
+        # Build Responses API format response
+        response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        result = {
+            "id": response_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": "completed",
+            "model": "deepseek-pro" if use_pro else "deepseek",
+            "output": [
+                {
+                    "type": "message",
+                    "id": f"msg_{uuid.uuid4().hex[:24]}",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": f"{source_tag} {content}",
+                        }
+                    ],
+                }
+            ],
+            "usage": payload.get("usage", {}),
+        }
+        return web.json_response(result)
     async def _claude_gateway_fallback(
         self,
         request: web.Request,
@@ -1551,6 +1742,234 @@ class ShimServer:
 _DROP_ITEM = object()
 
 
+def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Check for platform prefix like [deepseek], [deepseek-pro], [chatgpt] in user message.
+
+    Returns (modified_body, platform) where platform is one of:
+    - "deepseek" for [deepseek]
+    - "deepseek-pro" for [deepseek-pro]
+    - "chatgpt" for [chatgpt]
+    - None if no prefix found
+    """
+    import re
+    prefix_pattern = re.compile(r'^\s*\[(deepseek-pro|deepseek|chatgpt)\]\s*', re.IGNORECASE)
+
+    input_data = body.get("input")
+    if not input_data:
+        return body, None
+
+    # Handle string input
+    if isinstance(input_data, str):
+        match = prefix_pattern.match(input_data)
+        if match:
+            platform = match.group(1).lower()
+            new_body = dict(body)
+            new_body["input"] = input_data[match.end():].lstrip()
+            return new_body, platform
+        return body, None
+
+    # Handle list input. Codex resends the full conversation on every turn, so
+    # scan newest-to-oldest; otherwise an old [chatgpt] prefix permanently
+    # overrides a later [deepseek] / [deepseek-pro] selection.
+    if isinstance(input_data, list):
+        for i in range(len(input_data) - 1, -1, -1):
+            item = input_data[i]
+            if not isinstance(item, dict):
+                continue
+            if item.get("role") != "user":
+                continue
+            content = item.get("content")
+            # Handle string content
+            if isinstance(content, str):
+                match = prefix_pattern.match(content)
+                if match:
+                    platform = match.group(1).lower()
+                    new_body = dict(body)
+                    new_input = list(input_data)
+                    new_item = dict(item)
+                    new_item["content"] = content[match.end():].lstrip()
+                    new_input[i] = new_item
+                    new_body["input"] = new_input
+                    return new_body, platform
+            # Handle list content (e.g., [{"type": "input_text", "text": "..."}])
+            if isinstance(content, list):
+                for j in range(len(content) - 1, -1, -1):
+                    part = content[j]
+                    if not isinstance(part, dict):
+                        continue
+                    text = part.get("text") or part.get("input_text")
+                    if not text:
+                        continue
+                    match = prefix_pattern.match(text)
+                    if match:
+                        platform = match.group(1).lower()
+                        new_body = dict(body)
+                        new_input = list(input_data)
+                        new_item = dict(item)
+                        new_content = list(content)
+                        new_part = dict(part)
+                        text_key = "text" if "text" in part else "input_text"
+                        new_part[text_key] = text[match.end():].lstrip()
+                        new_content[j] = new_part
+                        new_item["content"] = new_content
+                        new_input[i] = new_item
+                        new_body["input"] = new_input
+                        return new_body, platform
+
+    return body, None
+
+
+def _deepseek_available() -> bool:
+    """Check if DeepSeek Web API is available."""
+    return DEEPSEEK_API_KEY_FILE.exists()
+
+
+def _get_deepseek_api_key() -> str | None:
+    """Read DeepSeek API key from file."""
+    try:
+        return DEEPSEEK_API_KEY_FILE.read_text().strip()
+    except Exception:
+        return None
+
+
+def _deepseek_item_text(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, dict):
+            text = part.get("text") or part.get("input_text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _compact_deepseek_value(value: Any) -> Any:
+    """Reduce verbose tool documentation without changing its schema."""
+    if isinstance(value, list):
+        return [_compact_deepseek_value(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    compacted: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "description" and isinstance(item, str) and len(item) > 240:
+            compacted[key] = item[:240] + "…"
+        else:
+            compacted[key] = _compact_deepseek_value(item)
+    return compacted
+
+
+def _deepseek_tool_is_relevant(tool: dict[str, Any], latest_user_text: str) -> bool:
+    """Drop only very large optional namespaces that are clearly unrelated."""
+    if tool.get("type") != "namespace":
+        return True
+    name = str(tool.get("name") or "").lower()
+    text = latest_user_text.lower()
+    if "pencil" in name:
+        return bool(re.search(r"\b(ui|ux|design|figma|canvas)\b|设计|界面|画布|原型|\.pen", text))
+    if "sites" in name:
+        return bool(
+            re.search(
+                r"\b(site|website|deploy|domain|analytics|d1|cloudflare)\b|"
+                r"网站|部署|域名|流量|数据库",
+                text,
+            )
+        )
+    return True
+
+
+def _is_deepseek_continuation(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    if len(normalized) > 100:
+        return False
+    return bool(
+        re.match(
+            r"^(继续|接着|再试|重试|再检查|再看看|继续修复|还有问题|不对|"
+            r"continue\b|retry\b|try again\b|keep going\b|fix it\b)",
+            normalized,
+        )
+    )
+
+
+def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Keep the current task/tool chain small enough for DeepSeek Web."""
+    sanitized = json.loads(json.dumps(body))
+    input_items = sanitized.get("input")
+    if not isinstance(input_items, list):
+        return sanitized
+
+    user_indices: list[int] = []
+    latest_user_text = ""
+    for index, item in enumerate(input_items):
+        if isinstance(item, dict) and item.get("role") == "user":
+            user_indices.append(index)
+    latest_user_index = user_indices[-1] if user_indices else None
+    if latest_user_index is not None:
+        latest_user_item = input_items[latest_user_index]
+        latest_user_text = _deepseek_item_text(latest_user_item)
+    if (
+        latest_user_index is not None
+        and len(user_indices) >= 2
+        and _is_deepseek_continuation(latest_user_text)
+    ):
+        previous_user_index = user_indices[-2]
+        previous_text = _deepseek_item_text(input_items[previous_user_index])
+        latest_user_index = previous_user_index
+        latest_user_text = f"{previous_text}\n{latest_user_text}"
+
+    # Keep the active user task and every tool call/result produced for it.
+    if latest_user_index is not None:
+        input_items = input_items[latest_user_index:]
+    elif len(input_items) > 40:
+        input_items = input_items[-40:]
+
+    cleaned_items: list[Any] = []
+    tool_output_indices = [
+        index
+        for index, item in enumerate(input_items)
+        if isinstance(item, dict)
+        and item.get("type") in {"function_call_output", "custom_tool_call_output"}
+    ]
+    recent_tool_outputs = set(tool_output_indices[-3:])
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            cleaned_items.append(item)
+            continue
+        if item.get("type") == "reasoning":
+            continue
+        cleaned = dict(item)
+        cleaned.pop("encrypted_content", None)
+        if cleaned.get("type") in {"function_call_output", "custom_tool_call_output"}:
+            max_length = 3000 if index in recent_tool_outputs else 1200
+            _truncate_tool_output(cleaned, max_length)
+        cleaned_items.append(cleaned)
+    sanitized["input"] = cleaned_items
+
+    tools = sanitized.get("tools")
+    if isinstance(tools, list):
+        relevant_tools = [
+            tool
+            for tool in tools
+            if not isinstance(tool, dict)
+            or _deepseek_tool_is_relevant(tool, latest_user_text)
+        ]
+        sanitized["tools"] = _compact_deepseek_value(relevant_tools)
+
+    before_size = len(json.dumps(body, ensure_ascii=False))
+    after_size = len(json.dumps(sanitized, ensure_ascii=False))
+    if after_size < before_size:
+        print(
+            f"[shim] DeepSeek context reduced {before_size} -> {after_size} chars; "
+            f"input {len(body.get('input') or [])} -> {len(cleaned_items)}, "
+            f"tools {len(body.get('tools') or [])} -> {len(sanitized.get('tools') or [])}",
+            flush=True,
+        )
+    return sanitized
+
+
 def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
     """Optimize input context to reduce token count without losing conversation structure.
 
@@ -1982,15 +2401,16 @@ class ResponsesStreamState:
         arg_delta = fn.get("arguments") or ""
         if arg_delta:
             state["arguments"] += arg_delta
-            await _write_sse(
-                response,
-                {
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": state["id"],
-                    "output_index": state["output_index"],
-                    "delta": arg_delta,
-                },
-            )
+            if state.get("output_type") != "custom_tool_call":
+                await _write_sse(
+                    response,
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": state["id"],
+                        "output_index": state["output_index"],
+                        "delta": arg_delta,
+                    },
+                )
 
     # ------------------------------------------------------------------
     # Anthropic deltas
@@ -2188,7 +2608,7 @@ class ResponsesStreamState:
         # so Codex Desktop knows not to validate against a fixed enum.
         original_type = self.tool_types.get(name, "")
         output_type = "function_call"
-        if original_type == "apply_patch":
+        if original_type in {"apply_patch", "custom"} or name == "apply_patch":
             output_type = "custom_tool_call"
         elif original_type.startswith("web_search"):
             output_type = "web_search_call"
@@ -2202,34 +2622,57 @@ class ResponsesStreamState:
             "output_type": output_type,
         }
         self.tool_calls[key] = state
+        item = {
+            "id": call_id,
+            "type": output_type,
+            "status": "in_progress",
+            "call_id": call_id,
+            "name": name,
+        }
+        item["input" if output_type == "custom_tool_call" else "arguments"] = ""
         await _write_sse(
             response,
             {
                 "type": "response.output_item.added",
                 "output_index": output_index,
-                "item": {
-                    "id": call_id,
-                    "type": output_type,
-                    "status": "in_progress",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": "",
-                },
+                "item": item,
             },
         )
         return state
 
     async def _close_tool(self, response: web.StreamResponse, state: dict[str, Any]) -> None:
         state["closed"] = True
-        await _write_sse(
-            response,
-            {
-                "type": "response.function_call_arguments.done",
-                "item_id": state["id"],
-                "output_index": state["output_index"],
-                "arguments": state["arguments"],
-            },
-        )
+        if state.get("output_type") == "custom_tool_call":
+            custom_input = _custom_tool_input(state["arguments"])
+            state["input"] = custom_input
+            await _write_sse(
+                response,
+                {
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": state["id"],
+                    "output_index": state["output_index"],
+                    "delta": custom_input,
+                },
+            )
+            await _write_sse(
+                response,
+                {
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": state["id"],
+                    "output_index": state["output_index"],
+                    "input": custom_input,
+                },
+            )
+        else:
+            await _write_sse(
+                response,
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": state["id"],
+                    "output_index": state["output_index"],
+                    "arguments": state["arguments"],
+                },
+            )
         await _write_sse(
             response,
             {
@@ -2352,14 +2795,18 @@ class ResponsesStreamState:
         }
 
     def _tool_item(self, state: dict[str, Any], status: str) -> dict[str, Any]:
-        return {
+        item = {
             "id": state["id"],
             "type": state.get("output_type", "function_call"),
             "status": status,
             "call_id": state["call_id"],
             "name": state["name"],
-            "arguments": state["arguments"],
         }
+        if item["type"] == "custom_tool_call":
+            item["input"] = state.get("input") or _custom_tool_input(state["arguments"])
+        else:
+            item["arguments"] = state["arguments"]
+        return item
 
     def _response(self, status: str, *, final: bool = False) -> dict[str, Any]:
         output: list[dict[str, Any]] = []
@@ -2410,6 +2857,20 @@ def _decode_thinking_payload(encoded: str) -> dict[str, Any] | None:
     except Exception:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _custom_tool_input(arguments: str) -> str:
+    """Unwrap the chat-compatible JSON envelope for a freeform custom tool."""
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, json.JSONDecodeError):
+        return arguments
+    if isinstance(parsed, dict):
+        for key in ("input", "patch"):
+            value = parsed.get(key)
+            if isinstance(value, str):
+                return value
+    return arguments
 
 
 def _build_tool_types(body: dict[str, Any]) -> dict[str, str]:

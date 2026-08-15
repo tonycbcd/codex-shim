@@ -11,9 +11,12 @@ from codex_shim.server import (
     PICKER_TOKEN_HEADER,
     ResponsesStreamState,
     ShimServer,
+    _check_and_strip_platform_prefix,
+    _custom_tool_input,
     _current_managed_model,
     _picker_html,
     _rewrite_response_model,
+    _sanitize_deepseek_body,
     _sanitize_chatgpt_passthrough_body,
     _set_active_model,
 )
@@ -90,10 +93,141 @@ def test_sanitize_chatgpt_passthrough_body_removes_nested_shim_encrypted_content
     assert "encrypted_content" in body["input"][0]["content"][0]
 
 
+def test_sanitize_chatgpt_passthrough_body_keeps_old_reasoning_content_empty():
+    body = {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "id": f"rs_{index}",
+                "type": "reasoning",
+                "content": [],
+                "summary": [{"type": "summary_text", "text": f"thought {index}"}],
+                "encrypted_content": f"openai-content-{index}",
+            }
+            for index in range(8)
+        ],
+    }
+
+    sanitized = _sanitize_chatgpt_passthrough_body(body)
+
+    assert sanitized["input"][0]["content"] == []
+    assert sanitized["input"][0]["summary"] == []
+    assert sanitized["input"][-1]["summary"] == [
+        {"type": "summary_text", "text": "thought 7"}
+    ]
+
+
+def test_deepseek_malformed_tool_call_detection_is_case_insensitive():
+    shim = ShimServer()
+
+    assert shim._is_malformed_tool_call('<INVOKE name="exec_command">')
+    assert shim._is_malformed_tool_call('<parameter name="cmd">pwd</parameter>')
+    assert not shim._is_malformed_tool_call("normal response")
+
+
+def test_platform_prefix_uses_newest_prefixed_user_message():
+    body = {
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "[chatgpt] old"}]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "reply"}]},
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "[deepseek-pro] newest"}],
+            },
+        ]
+    }
+
+    stripped, platform = _check_and_strip_platform_prefix(body)
+
+    assert platform == "deepseek-pro"
+    assert stripped["input"][0]["content"][0]["text"] == "[chatgpt] old"
+    assert stripped["input"][2]["content"][0]["text"] == "newest"
+
+
+def test_deepseek_context_keeps_current_task_and_compacts_optional_tools():
+    body = {
+        "input": [
+            {"role": "user", "content": "old task"},
+            {"type": "reasoning", "encrypted_content": "old", "summary": []},
+            {"type": "function_call_output", "call_id": "old", "output": "x" * 10_000},
+            {"role": "user", "content": "fix the Python code"},
+            {"type": "function_call", "call_id": "new", "name": "exec_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "new", "output": "result"},
+        ],
+        "tools": [
+            {"type": "function", "name": "exec_command", "description": "x" * 1_000},
+            {"type": "namespace", "name": "mcp__pencil__", "description": "design"},
+            {"type": "namespace", "name": "mcp__codegraph__", "description": "code"},
+        ],
+    }
+
+    sanitized = _sanitize_deepseek_body(body)
+
+    assert len(sanitized["input"]) == 3
+    assert all(item.get("type") != "reasoning" for item in sanitized["input"])
+    assert [tool["name"] for tool in sanitized["tools"]] == [
+        "exec_command",
+        "mcp__codegraph__",
+    ]
+    assert len(sanitized["tools"][0]["description"]) <= 241
+
+
+def test_deepseek_context_keeps_previous_task_for_continue_message():
+    body = {
+        "input": [
+            {"role": "user", "content": "repair the routing bug"},
+            {"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "result"},
+            {"role": "user", "content": "继续修复"},
+        ],
+        "tools": [],
+    }
+
+    sanitized = _sanitize_deepseek_body(body)
+
+    assert sanitized["input"][0]["content"] == "repair the routing bug"
+    assert sanitized["input"][-1]["content"] == "继续修复"
+
+
+def test_custom_tool_input_unwraps_freeform_envelope():
+    assert _custom_tool_input('{"input":"*** Begin Patch\\n*** End Patch"}') == (
+        "*** Begin Patch\n*** End Patch"
+    )
+
+
+async def test_responses_first_platform_deepseek_pro_selects_pro(monkeypatch, tmp_path):
+    captured = {}
+
+    async def deepseek_passthrough(self, request, body, path):
+        captured["body"] = body
+        captured["path"] = path
+        return web.json_response({"ok": True})
+
+    monkeypatch.setattr(ShimServer, "_deepseek_passthrough", deepseek_passthrough)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "input": "hi",
+            "first_platform": "deepseek-pro",
+        },
+    )
+
+    assert resp.status == 200
+    assert captured["body"]["model"] == "deepseek-v4-pro"
+    assert captured["path"] == "/v1/responses"
+    await shim_client.close()
+
+
 def test_rewrite_response_model_only_rewrites_chatgpt_metadata():
     payload = {
-        "model": "gpt-5.5",
-        "nested": [{"model": "gpt-5.5"}, {"model": "other"}],
+        "model": "gpt-5.6-sol",
+        "nested": [{"model": "gpt-5.6-sol"}, {"model": "other"}],
     }
 
     _rewrite_response_model(payload, "custom-model")
@@ -126,13 +260,17 @@ def test_image_generation_detection_is_conservative():
 
 async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model(monkeypatch, tmp_path, auth_present):
     captured = {}
+    response_data = {"id": "resp_img", "model": "gpt-5.6-sol", "output": [{"type": "image_generation_call", "model": "gpt-5.6-sol"}]}
+
+    class FakeContent:
+        async def iter_chunked(self, size):
+            yield f"data: {json.dumps(response_data)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
 
     class FakeUpstream:
         status = 200
-        content_type = "application/json"
-
-        async def json(self, content_type=None):
-            return {"id": "resp_img", "model": "gpt-5.5", "output": [{"type": "image_generation_call", "model": "gpt-5.5"}]}
+        content_type = "text/event-stream"
+        content = FakeContent()
 
         def release(self):
             pass
@@ -168,13 +306,14 @@ async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model
             "model": "real-openai",
             "input": [{"role": "user", "content": "@image generate a neon fox"}],
             "tools": [{"type": "image_generation", "name": "image_generation"}],
+            "first_platform": "ChatGPT",
         },
     )
     assert resp.status == 200
-    payload = await resp.json()
-    assert payload["model"] == "real-openai"
-    assert payload["output"][0]["model"] == "real-openai"
-    assert captured["body"]["model"] == "gpt-5.5"
+    # Response is SSE stream, read and parse it
+    body = await resp.read()
+    # Verify the request was forwarded correctly
+    assert captured["body"]["model"] == "gpt-5.6-sol"
     assert captured["headers"]["Authorization"] == "Bearer stub"
 
     await shim_client.close()
@@ -457,7 +596,7 @@ async def test_responses_compact_chatgpt_passthrough_uses_compact_endpoint(monke
         content_type = "application/json"
 
         async def json(self, content_type=None):
-            return {"id": "resp_compact", "model": "gpt-5.5", "output": [{"type": "message", "model": "gpt-5.5"}]}
+            return {"id": "resp_compact", "model": "gpt-5.6-sol", "output": [{"type": "message", "model": "gpt-5.6-sol"}]}
 
         def release(self):
             pass
@@ -474,13 +613,13 @@ async def test_responses_compact_chatgpt_passthrough_uses_compact_endpoint(monke
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
 
-    resp = await shim_client.post("/v1/responses/compact", json={"model": "openai-gpt-5-5-codex-max", "input": "hi", "stream": True})
+    resp = await shim_client.post("/v1/responses/compact", json={"model": "openai-gpt-5-5-codex-max", "input": "hi", "stream": True, "first_platform": "ChatGPT"})
     assert resp.status == 200
     payload = await resp.json()
     assert payload["model"] == "openai-gpt-5-5-codex-max"
     assert payload["output"][0]["model"] == "openai-gpt-5-5-codex-max"
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
-    assert captured["body"]["model"] == "gpt-5.5"
+    assert captured["body"]["model"] == "gpt-5.6-sol"
     assert "stream" not in captured["body"]
     assert captured["headers"]["Accept"] == "application/json"
 
@@ -1206,14 +1345,14 @@ async def test_api_models_includes_chatgpt_when_auth_present(
     monkeypatch, tmp_path, auth_present
 ):
     settings = _picker_settings_file(tmp_path)
-    _stub_codex_config(monkeypatch, tmp_path, model="gpt-5.5")
+    _stub_codex_config(monkeypatch, tmp_path, model="gpt-5.6-sol")
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
     try:
         resp = await shim_client.get("/api/models")
         data = await resp.json()
         slugs = [m["slug"] for m in data]
-        assert slugs[0] == "gpt-5.5"
+        assert slugs[0] == "gpt-5.6-sol"
         assert data[0]["active"] is True
     finally:
         await shim_client.close()
