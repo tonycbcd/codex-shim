@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import secrets
@@ -928,6 +929,256 @@ class ShimServer:
             )
         )
 
+    @staticmethod
+    def _recover_deepseek_tool_calls(text: str) -> list[dict[str, Any]]:
+        """Recover common DeepSeek XML tool-call variants missed upstream."""
+
+        def attribute_name(attributes: str) -> str:
+            match = re.search(r'\bname\s*=\s*["\']([^"\']+)["\']', attributes, re.IGNORECASE)
+            return match.group(1).strip() if match else ""
+
+        def arguments_from_parameters(body: str) -> dict[str, Any] | None:
+            arguments: dict[str, Any] = {}
+            for match in re.finditer(
+                r"<\s*parameter\b(?P<attrs>[^>]*)>(?P<value>[\s\S]*?)<\s*/\s*parameter\s*>",
+                body,
+                re.IGNORECASE,
+            ):
+                name = attribute_name(match.group("attrs"))
+                if not name:
+                    continue
+                raw = html.unescape(match.group("value")).strip()
+                force_string = bool(
+                    re.search(r'\bstring\s*=\s*["\']true["\']', match.group("attrs"), re.IGNORECASE)
+                )
+                if force_string:
+                    arguments[name] = raw
+                    continue
+                try:
+                    arguments[name] = json.loads(raw)
+                except (TypeError, ValueError):
+                    arguments[name] = raw
+            return arguments or None
+
+        calls: list[dict[str, Any]] = []
+        normalized_text = re.sub(
+            r"<\s*/?\s*(?:tool[_-]?calls|_?calls)\b[^>]*>",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        direct_block = re.compile(
+            r"<\s*(?P<tag>[A-Za-z_][\w:.-]*)\b(?P<attrs>[^>]*)>"
+            r"(?P<body>[\s\S]*?)<\s*/\s*(?P=tag)\s*>",
+            re.IGNORECASE,
+        )
+        for match in direct_block.finditer(normalized_text):
+            tag = match.group("tag")
+            if re.fullmatch(r"(?:tool[_-]?calls?|_?calls?|parameter)", tag, re.IGNORECASE):
+                continue
+            attributes = match.group("attrs")
+            body_text = match.group("body").strip()
+            name = attribute_name(attributes)
+            if not name and tag.lower() != "invoke":
+                name = tag
+            if not name:
+                continue
+
+            payload: Any = None
+            try:
+                payload, _ = json.JSONDecoder().raw_decode(body_text)
+            except (TypeError, ValueError):
+                pass
+
+            arguments: Any = None
+            if isinstance(payload, dict):
+                function = payload.get("function")
+                nested = function if isinstance(function, dict) else payload
+                payload_name = nested.get("name") or payload.get("name")
+                if isinstance(payload_name, str) and payload_name.strip():
+                    name = payload_name.strip()
+                arguments = nested.get("arguments")
+                if arguments is None:
+                    arguments = {
+                        key: value
+                        for key, value in nested.items()
+                        if key not in {"name", "function"}
+                    }
+            if arguments is None:
+                arguments = arguments_from_parameters(body_text)
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (TypeError, ValueError):
+                    pass
+            if arguments is None:
+                continue
+
+            calls.append(
+                {
+                    "index": len(calls),
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+                    },
+                }
+            )
+
+        # DeepSeek occasionally truncates or corrupts the opening tag while
+        # keeping a usable tool name and complete <parameter> children, e.g.
+        # ``<oke name="exec_command"> ... </invoke>``. Recover that form even
+        # though the XML tags no longer match.
+        if not calls:
+            loose_open = re.search(
+                r"<\s*(?!parameter\b)[^>]*\bname\s*=\s*[\"'](?P<name>[^\"']+)[\"'][^>]*>",
+                normalized_text,
+                re.IGNORECASE,
+            )
+            loose_arguments = arguments_from_parameters(normalized_text)
+            if loose_open and loose_arguments:
+                calls.append(
+                    {
+                        "index": 0,
+                        "id": f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {
+                            "name": loose_open.group("name").strip(),
+                            "arguments": json.dumps(
+                                loose_arguments,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    }
+                )
+        return calls
+
+    @staticmethod
+    def _sanitize_deepseek_tool_arguments(
+        value: Any,
+        schema: dict[str, Any] | None,
+    ) -> Any:
+        """Coerce/remove invalid optional values DeepSeek invents for tools."""
+        invalid = object()
+
+        def clean(current: Any, current_schema: Any) -> Any:
+            if not isinstance(current_schema, dict):
+                return current
+            expected = current_schema.get("type")
+            expected_types = expected if isinstance(expected, list) else [expected]
+
+            if "object" in expected_types or isinstance(current_schema.get("properties"), dict):
+                if not isinstance(current, dict):
+                    return invalid
+                properties = current_schema.get("properties")
+                properties = properties if isinstance(properties, dict) else {}
+                required = set(current_schema.get("required") or [])
+                additional = current_schema.get("additionalProperties", True)
+                result: dict[str, Any] = {}
+                for key, item in current.items():
+                    child_schema = properties.get(key)
+                    if child_schema is None:
+                        if additional is not False:
+                            result[key] = item
+                        continue
+                    cleaned = clean(item, child_schema)
+                    if cleaned is invalid:
+                        if key in required:
+                            result[key] = item
+                        continue
+                    result[key] = cleaned
+                return result
+
+            if "array" in expected_types:
+                if not isinstance(current, list):
+                    return invalid
+                item_schema = current_schema.get("items")
+                result = []
+                for item in current:
+                    cleaned = clean(item, item_schema)
+                    if cleaned is not invalid:
+                        result.append(cleaned)
+                return result
+
+            if "boolean" in expected_types:
+                if isinstance(current, bool):
+                    return current
+                if isinstance(current, str) and current.lower() in {"true", "false"}:
+                    return current.lower() == "true"
+                return invalid
+
+            if "integer" in expected_types:
+                if isinstance(current, int) and not isinstance(current, bool):
+                    return current
+                if isinstance(current, float) and current.is_integer():
+                    return int(current)
+                if isinstance(current, str) and re.fullmatch(r"-?\d+", current.strip()):
+                    return int(current)
+                return invalid
+
+            if "number" in expected_types:
+                if isinstance(current, (int, float)) and not isinstance(current, bool):
+                    return current
+                if isinstance(current, str):
+                    try:
+                        return float(current)
+                    except ValueError:
+                        return invalid
+                return invalid
+
+            if "string" in expected_types and not isinstance(current, str):
+                return invalid
+            if expected_types == ["null"] and current is not None:
+                return invalid
+            return current
+
+        cleaned = clean(value, schema)
+        return value if cleaned is invalid else cleaned
+
+    @staticmethod
+    def _deepseek_tool_schemas(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        schemas: dict[str, dict[str, Any]] = {}
+        for tool in body.get("tools") or []:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            definition = function if isinstance(function, dict) else tool
+            name = definition.get("name")
+            schema = definition.get("parameters") or definition.get("input_schema")
+            if isinstance(name, str) and isinstance(schema, dict):
+                schemas[name] = schema
+        return schemas
+
+    @classmethod
+    def _sanitize_deepseek_delta_tool_calls(
+        cls,
+        delta: dict[str, Any],
+        schemas: dict[str, dict[str, Any]],
+    ) -> None:
+        for call in delta.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            arguments = function.get("arguments")
+            schema = schemas.get(name) if isinstance(name, str) else None
+            if not schema or not isinstance(arguments, str):
+                continue
+            try:
+                parsed = json.loads(arguments)
+            except (TypeError, ValueError):
+                continue
+            cleaned = cls._sanitize_deepseek_tool_arguments(parsed, schema)
+            function["arguments"] = json.dumps(
+                cleaned,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
     async def _deepseek_passthrough(
         self,
         request: web.Request,
@@ -1004,10 +1255,12 @@ class ShimServer:
 
             model_name = "deepseek-pro" if use_pro else "deepseek"
             tool_types = _build_tool_types(body)
+            tool_schemas = self._deepseek_tool_schemas(body)
             state = ResponsesStreamState(model_name, tool_types)
 
             chunk_count = 0
             source_injected = False
+            recovered_tool_index = 10000
             try:
                 await state.start(response)
                 async for line in _sse_lines(upstream):
@@ -1026,6 +1279,32 @@ class ShimServer:
                         continue
                     delta = choices[0].get("delta") or {}
                     content = delta.get("content") or ""
+
+                    # Never expose DeepSeek's malformed XML tool protocol to
+                    # Codex. The compatibility service normally converts it
+                    # into standard tool_calls; this is a final safety net for
+                    # incomplete or previously unseen tag variants.
+                    if content and self._is_malformed_tool_call(content):
+                        existing_calls = delta.get("tool_calls")
+                        recovered_calls = (
+                            [] if isinstance(existing_calls, list) and existing_calls
+                            else self._recover_deepseek_tool_calls(content)
+                        )
+                        print(
+                            f"[shim] DeepSeek: suppressed malformed tool XML ({len(content)} chars), "
+                            f"recovered_calls={len(recovered_calls)}",
+                            flush=True,
+                        )
+                        delta["content"] = ""
+                        if recovered_calls:
+                            for recovered_call in recovered_calls:
+                                recovered_call["index"] = recovered_tool_index
+                                recovered_tool_index += 1
+                            delta["tool_calls"] = recovered_calls
+                        content = ""
+
+                    if delta.get("tool_calls"):
+                        self._sanitize_deepseek_delta_tool_calls(delta, tool_schemas)
 
                     # Inject source tag before first content.
                     if content and not source_injected:
@@ -1046,19 +1325,44 @@ class ShimServer:
         payload = await upstream.json(content_type=None)
         choices = payload.get("choices") or []
         content = ""
+        upstream_tool_calls: list[dict[str, Any]] = []
         if choices:
             message = choices[0].get("message") or {}
             content = message.get("content") or ""
+            if isinstance(message.get("tool_calls"), list):
+                upstream_tool_calls = message["tool_calls"]
 
         # Build Responses API format response
         response_id = f"resp_{uuid.uuid4().hex[:24]}"
-        result = {
-            "id": response_id,
-            "object": "response",
-            "created_at": int(time.time()),
-            "status": "completed",
-            "model": "deepseek-pro" if use_pro else "deepseek",
-            "output": [
+        output: list[dict[str, Any]] = []
+        tool_schemas = self._deepseek_tool_schemas(body)
+        for index, call in enumerate(upstream_tool_calls):
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            arguments = function.get("arguments")
+            if not isinstance(name, str) or not name or not isinstance(arguments, str):
+                continue
+            normalized = {"tool_calls": [call]}
+            self._sanitize_deepseek_delta_tool_calls(normalized, tool_schemas)
+            sanitized_call = normalized["tool_calls"][0]
+            sanitized_function = sanitized_call.get("function") or function
+            call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
+            output.append(
+                {
+                    "type": "function_call",
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": sanitized_function["name"],
+                    "arguments": sanitized_function["arguments"],
+                }
+            )
+        if content or not output:
+            output.append(
                 {
                     "type": "message",
                     "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -1071,7 +1375,14 @@ class ShimServer:
                         }
                     ],
                 }
-            ],
+            )
+        result = {
+            "id": response_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": "completed",
+            "model": "deepseek-pro" if use_pro else "deepseek",
+            "output": output,
             "usage": payload.get("usage", {}),
         }
         return web.json_response(result)
@@ -1847,6 +2158,42 @@ def _deepseek_item_text(item: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _clip_deepseek_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    marker = "\n...[older DeepSeek context truncated]...\n"
+    remaining = max(0, limit - len(marker))
+    head = remaining // 2
+    return f"{text[:head]}{marker}{text[-(remaining - head):]}"
+
+
+def _truncate_deepseek_message(item: dict[str, Any], limit: int) -> None:
+    text = _deepseek_item_text(item)
+    if not text or len(text) <= limit:
+        return
+    item["content"] = _clip_deepseek_text(text, limit)
+
+
+def _strip_deepseek_source_tag(item: dict[str, Any]) -> None:
+    """Keep replayed assistant text equal to the vendor's untagged session turn."""
+    if item.get("role") != "assistant":
+        return
+    content = item.get("content")
+    prefix = re.compile(r"^\s*\[(?:deepseek-pro|deepseek)\]\s*", re.IGNORECASE)
+    if isinstance(content, str):
+        item["content"] = prefix.sub("", content, count=1)
+        return
+    if not isinstance(content, list):
+        return
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        for key in ("text", "input_text"):
+            if isinstance(part.get(key), str):
+                part[key] = prefix.sub("", part[key], count=1)
+                return
+
+
 def _compact_deepseek_value(value: Any) -> Any:
     """Reduce verbose tool documentation without changing its schema."""
     if isinstance(value, list):
@@ -1897,6 +2244,22 @@ def _is_deepseek_continuation(text: str) -> bool:
 def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
     """Keep the current task/tool chain small enough for DeepSeek Web."""
     sanitized = json.loads(json.dumps(body))
+    agent_rules = (
+        "DeepSeek Codex execution rules:\n"
+        "- When asked to modify or fix a project, continue using tools until code is changed and tests or a concrete verification run.\n"
+        "- Do not end while an update_plan item is still in_progress or while the requested modification is unverified.\n"
+        "- Do not repeatedly read the same successful file/range. After enough evidence, edit the code or report a specific blocker.\n"
+        "- If a tool call fails because of arguments, immediately retry with only valid required arguments.\n"
+        "- Keep every integer tool argument as an integer, never as a decimal such as 20000.0.\n"
+        "- Stay in the request's current project/workdir. Never scan / or unrelated repositories to guess the task.\n"
+        "- A progress list, artifact list, or source list is not a completed implementation."
+    )
+    existing_instructions = sanitized.get("instructions")
+    sanitized["instructions"] = (
+        f"{existing_instructions}\n\n{agent_rules}"
+        if isinstance(existing_instructions, str) and existing_instructions.strip()
+        else agent_rules
+    )
     input_items = sanitized.get("input")
     if not isinstance(input_items, list):
         return sanitized
@@ -1910,21 +2273,39 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
     if latest_user_index is not None:
         latest_user_item = input_items[latest_user_index]
         latest_user_text = _deepseek_item_text(latest_user_item)
-    if (
-        latest_user_index is not None
-        and len(user_indices) >= 2
-        and _is_deepseek_continuation(latest_user_text)
-    ):
-        previous_user_index = user_indices[-2]
-        previous_text = _deepseek_item_text(input_items[previous_user_index])
-        latest_user_index = previous_user_index
-        latest_user_text = f"{previous_text}\n{latest_user_text}"
+    if latest_user_index is not None and _is_deepseek_continuation(latest_user_text):
+        continuation_text = latest_user_text
+        # A long Codex session can contain several consecutive "继续/重试"
+        # messages. Walk back to the nearest concrete user task instead of
+        # anchoring recovery to another context-free continuation.
+        for previous_user_index in reversed(user_indices[:-1]):
+            previous_text = _deepseek_item_text(input_items[previous_user_index])
+            if not previous_text.strip():
+                continue
+            latest_user_index = previous_user_index
+            latest_user_text = f"{previous_text}\n{continuation_text}"
+            if not _is_deepseek_continuation(previous_text):
+                break
 
-    # Keep the active user task and every tool call/result produced for it.
+    # Keep several preceding user/assistant turns so follow-up questions retain
+    # the DSL, code, or decision they refer to. Older tool transcripts are
+    # intentionally dropped; only the active task's tool chain is replayed.
+    context_start_index = latest_user_index
     if latest_user_index is not None:
-        input_items = input_items[latest_user_index:]
+        anchor_position = max(
+            index
+            for index, user_index in enumerate(user_indices)
+            if user_index <= latest_user_index
+        )
+        context_position = max(0, anchor_position - 5)
+        context_start_index = user_indices[context_position]
+        active_offset = latest_user_index - context_start_index
+        input_items = input_items[context_start_index:]
     elif len(input_items) > 40:
+        active_offset = 0
         input_items = input_items[-40:]
+    else:
+        active_offset = 0
 
     cleaned_items: list[Any] = []
     tool_output_indices = [
@@ -1938,12 +2319,27 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict):
             cleaned_items.append(item)
             continue
+        if index < active_offset and item.get("type") in {
+            "function_call",
+            "function_call_output",
+            "custom_tool_call",
+            "custom_tool_call_output",
+        }:
+            continue
         if item.get("type") == "reasoning":
             continue
         cleaned = dict(item)
         cleaned.pop("encrypted_content", None)
+        _strip_deepseek_source_tag(cleaned)
+        if cleaned.get("role") == "user":
+            _truncate_deepseek_message(
+                cleaned,
+                16_000 if index >= active_offset else 8_000,
+            )
+        elif cleaned.get("role") == "assistant":
+            _truncate_deepseek_message(cleaned, 6_000)
         if cleaned.get("type") in {"function_call_output", "custom_tool_call_output"}:
-            max_length = 3000 if index in recent_tool_outputs else 1200
+            max_length = 6000 if index in recent_tool_outputs else 2000
             _truncate_tool_output(cleaned, max_length)
         cleaned_items.append(cleaned)
     sanitized["input"] = cleaned_items

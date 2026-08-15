@@ -1,0 +1,323 @@
+diff --git a/vendor/deepseek-web-api/dist/deepseek/chatStream.js b/vendor/deepseek-web-api/dist/deepseek/chatStream.js
+index f606765..b81f923 100644
+--- a/vendor/deepseek-web-api/dist/deepseek/chatStream.js
++++ b/vendor/deepseek-web-api/dist/deepseek/chatStream.js
+@@ -78,7 +78,7 @@ export async function consumeToolChat(run, emptyFallback) {
+             responseText += update.delta;
+     }
+     return {
+-        outcome: resolveToolTurn(responseText, reasoningText, `chatcmpl_${run.sessionId}`, emptyFallback),
++        outcome: resolveToolTurn(responseText, reasoningText, `chatcmpl_${run.sessionId}`, emptyFallback, run.toolDefinitions),
+         responseMessageId,
+     };
+ }
+@@ -90,6 +90,13 @@ export function toolDiagnostics(outcome) {
+         emptyUpstream: outcome.emptyUpstream,
+         recoverableEmpty: outcome.recoverableEmpty,
+         promotedReasoning: outcome.promotedReasoning,
++        ...(outcome.recoverableEmpty
++            ? {
++                outputPreview: outcome.outputText.slice(0, 4000),
++                outputTail: outcome.outputText.slice(-4000),
++                reasoningPreview: outcome.reasoningText.slice(0, 2000),
++            }
++            : {}),
+     };
+ }
+ /** Emit one buffered tool-compatible result after retry selection. */
+diff --git a/vendor/deepseek-web-api/dist/deepseek/client.js b/vendor/deepseek-web-api/dist/deepseek/client.js
+index 81ffd37..d18a4ec 100644
+--- a/vendor/deepseek-web-api/dist/deepseek/client.js
++++ b/vendor/deepseek-web-api/dist/deepseek/client.js
+@@ -7,6 +7,12 @@ import { prepareCompletion } from "./pow.js";
+ import { buildDeepSeekPrompt, buildToolRecoveryPrompt } from "./promptBuild.js";
+ import { canonicalAssistantText } from "./toolCalls.js";
+ import { EMPTY_TOOL_RESPONSE_TEXT } from "./toolOutcome.js";
++function toolDefinitions(body) {
++    return [
++        ...(Array.isArray(body.tools) ? body.tools : []),
++        ...(Array.isArray(body.functions) ? body.functions : []),
++    ];
++}
+ export class DeepSeekClient {
+     config;
+     login;
+@@ -173,6 +179,7 @@ export class DeepSeekClient {
+             toolsFingerprint: retryFrom ? retryFrom.toolsFingerprint : built?.toolsFingerprint ?? "",
+             latestUserText: retryFrom ? retryFrom.latestUserText : built?.latestUserText ?? "",
+             hasTools: retryFrom ? retryFrom.hasTools : built?.hasTools ?? false,
++            toolDefinitions: retryFrom ? retryFrom.toolDefinitions : toolDefinitions(body),
+             retry,
+         };
+     }
+@@ -186,6 +193,7 @@ export class DeepSeekClient {
+             searchEnabled: run.search,
+             toolCompatibilityEnabled: run.hasTools,
+             toolReasoning: this.config.toolReasoning,
++            toolDefinitions: run.toolDefinitions,
+         };
+     }
+     setResponseMetadata(result, run, retry) {
+@@ -200,7 +208,7 @@ export class DeepSeekClient {
+             this.logger.info("DeepSeek upstream returned empty channels", fields);
+     }
+     logFields(run, diagnostics) {
+-        return {
++        const fields = {
+             sessionId: run.sessionId,
+             reused: run.reusedSession,
+             parentMessageId: run.parentMessageId,
+@@ -211,6 +219,12 @@ export class DeepSeekClient {
+             emptyUpstream: diagnostics.emptyUpstream,
+             retry: run.retry,
+         };
++        if (diagnostics.recoverableEmpty) {
++            fields.outputPreview = diagnostics.outputPreview ?? "";
++            fields.outputTail = diagnostics.outputTail ?? "";
++            fields.reasoningPreview = diagnostics.reasoningPreview ?? "";
++        }
++        return fields;
+     }
+     remember(run, responseMessageId, responseText) {
+         const canonical = canonicalAssistantText(responseText);
+diff --git a/vendor/deepseek-web-api/dist/deepseek/mapResponses.d.ts b/vendor/deepseek-web-api/dist/deepseek/mapResponses.d.ts
+index 3c0ee87..906a2bb 100644
+--- a/vendor/deepseek-web-api/dist/deepseek/mapResponses.d.ts
++++ b/vendor/deepseek-web-api/dist/deepseek/mapResponses.d.ts
+@@ -52,6 +52,7 @@ export declare function consumeResponses(input: {
+     searchEnabled: boolean;
+     toolCompatibilityEnabled: boolean;
+     toolReasoning: ToolReasoningMode;
++    toolDefinitions?: unknown[];
+     emptyToolResponseText?: string;
+     emit?: ResponseEmitter;
+ }): Promise<MappedResponseResult>;
+diff --git a/vendor/deepseek-web-api/dist/deepseek/mapResponses.js b/vendor/deepseek-web-api/dist/deepseek/mapResponses.js
+index f4d759c..39d66e1 100644
+--- a/vendor/deepseek-web-api/dist/deepseek/mapResponses.js
++++ b/vendor/deepseek-web-api/dist/deepseek/mapResponses.js
+@@ -51,7 +51,7 @@ export async function consumeResponses(input) {
+         }
+     }
+     const toolOutcome = input.toolCompatibilityEnabled
+-        ? resolveToolTurn(outputText, reasoning, id, input.emptyToolResponseText ?? EMPTY_TOOL_RESPONSE_TEXT)
++        ? resolveToolTurn(outputText, reasoning, id, input.emptyToolResponseText ?? EMPTY_TOOL_RESPONSE_TEXT, input.toolDefinitions)
+         : null;
+     const parsed = toolOutcome?.parsed ?? { content: outputText, toolCalls: [] };
+     const hasToolCalls = parsed.toolCalls.length > 0;
+@@ -137,6 +137,13 @@ export async function consumeResponses(input) {
+             emptyUpstream: toolOutcome?.emptyUpstream ?? (!reasoning.trim() && !outputText.trim()),
+             recoverableEmpty: toolOutcome?.recoverableEmpty ?? false,
+             promotedReasoning: toolOutcome?.promotedReasoning ?? false,
++            ...(toolOutcome?.recoverableEmpty
++                ? {
++                    outputPreview: outputText.slice(0, 4000),
++                    outputTail: outputText.slice(-4000),
++                    reasoningPreview: reasoning.slice(0, 2000),
++                }
++                : {}),
+         },
+     };
+ }
+diff --git a/vendor/deepseek-web-api/dist/deepseek/promptBuild.js b/vendor/deepseek-web-api/dist/deepseek/promptBuild.js
+index e8ef0ae..c23d446 100644
+--- a/vendor/deepseek-web-api/dist/deepseek/promptBuild.js
++++ b/vendor/deepseek-web-api/dist/deepseek/promptBuild.js
+@@ -246,7 +246,7 @@ export function buildToolRecoveryPrompt(body, requestTurns, latestUserText, retr
+     const policy = [
+         "The previous upstream completion produced no usable tool call or final answer. Continue the same task.",
+         strict
+-            ? "Do not analyze or explain the next step. Emit exactly one executable <tool_call> JSON block now, unless the task is already complete."
++            ? "Do not analyze or explain the next step. Emit exactly one executable <tool_call> JSON block now, unless the task is already complete. Write the opening tag once, one JSON object with name first and arguments second, then one closing tag. Never repeat empty wrappers or tags."
+             : "After tool results, output either complete <tool_call> JSON blocks in RESPONSE or the final user-visible answer in RESPONSE.",
+         "Never end with THINK-only and never leave RESPONSE empty.",
+         "Tool arguments MUST satisfy the compact schema below; include every required field.",
+diff --git a/vendor/deepseek-web-api/dist/deepseek/toolCalls.d.ts b/vendor/deepseek-web-api/dist/deepseek/toolCalls.d.ts
+index 4d0d165..7458ef1 100644
+--- a/vendor/deepseek-web-api/dist/deepseek/toolCalls.d.ts
++++ b/vendor/deepseek-web-api/dist/deepseek/toolCalls.d.ts
+@@ -13,9 +13,9 @@ export interface ParsedToolCalls {
+ export declare function stableJson(value: unknown, pretty?: boolean): string;
+ export declare function formatToolCall(name: string, argumentsValue: unknown): string | null;
+ /** Parse model tool-call text into OpenAI-compatible calls and cleaned content. */
+-export declare function parseToolCalls(text: string, seed?: string): ParsedToolCalls;
++export declare function parseToolCalls(text: string, seed?: string, toolDefinitions?: unknown[]): ParsedToolCalls;
+ /** Prefer valid output calls, then promote calls leaked into reasoning. */
+-export declare function parseToolCallsFromParts(outputText: string, reasoningText: string, seed?: string): ParsedToolCalls;
++export declare function parseToolCallsFromParts(outputText: string, reasoningText: string, seed?: string, toolDefinitions?: unknown[]): ParsedToolCalls;
+ export declare function canonicalParsedAssistantText(parsed: ParsedToolCalls): string;
+ /** Store a canonical assistant turn so structured client history can match it later. */
+ export declare function canonicalAssistantText(text: string): string;
+diff --git a/vendor/deepseek-web-api/dist/deepseek/toolCalls.js b/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
+index d528d64..387acd9 100644
+--- a/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
++++ b/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
+@@ -34,11 +34,50 @@ function argumentObject(value) {
+         return null;
+     }
+ }
+-function callPayload(value, attributeName = "") {
++function normalizedToolDefinitions(toolDefinitions) {
++    if (!Array.isArray(toolDefinitions))
++        return [];
++    return toolDefinitions.flatMap((definition) => {
++        if (!isRecord(definition))
++            return [];
++        const nested = isRecord(definition.function) ? definition.function : definition;
++        const name = typeof nested.name === "string" ? nested.name.trim() : "";
++        const schema = isRecord(nested.parameters)
++            ? nested.parameters
++            : isRecord(nested.input_schema)
++                ? nested.input_schema
++                : {};
++        return name ? [{ name, schema }] : [];
++    });
++}
++function inferredToolName(argumentsValue, toolDefinitions) {
++    const definitions = normalizedToolDefinitions(toolDefinitions);
++    if (definitions.length === 1)
++        return definitions[0].name;
++    const keys = Object.keys(argumentsValue);
++    const ranked = definitions
++        .map(({ name, schema }) => {
++        const properties = isRecord(schema.properties) ? schema.properties : {};
++        const required = Array.isArray(schema.required)
++            ? schema.required.filter((key) => typeof key === "string")
++            : [];
++        if (required.some((key) => !(key in argumentsValue)))
++            return { name, score: -1 };
++        const overlap = keys.filter((key) => key in properties).length;
++        const unknown = keys.filter((key) => !(key in properties)).length;
++        return { name, score: overlap * 4 + required.length * 2 - unknown };
++    })
++        .filter(({ score }) => score > 0)
++        .sort((left, right) => right.score - left.score);
++    if (ranked.length === 0 || (ranked[1] && ranked[0].score === ranked[1].score))
++        return "";
++    return ranked[0].name;
++}
++function callPayload(value, attributeName = "", toolDefinitions = []) {
+     if (!isRecord(value))
+         return null;
+     const nested = isRecord(value.function) ? value.function : value;
+-    const name = (typeof nested.name === "string" ? nested.name.trim() : "") ||
++    let name = (typeof nested.name === "string" ? nested.name.trim() : "") ||
+         (typeof value.name === "string" ? value.name.trim() : "") ||
+         attributeName.trim();
+     let argumentsValue = argumentObject(nested.arguments);
+@@ -46,6 +85,8 @@ function callPayload(value, attributeName = "") {
+         const rest = Object.fromEntries(Object.entries(nested).filter(([key]) => key !== "name" && key !== "function"));
+         argumentsValue = Object.keys(rest).length > 0 ? argumentObject(rest) : null;
+     }
++    if (!name && argumentsValue)
++        name = inferredToolName(argumentsValue, toolDefinitions);
+     return name && argumentsValue ? { name, arguments: argumentsValue } : null;
+ }
+ function callId(seed, index, payload) {
+@@ -161,7 +202,7 @@ function pushUnique(toolCalls, seed, payload, seen) {
+         function: { name: payload.name, arguments: argumentsText },
+     });
+ }
+-function taggedCandidates(text, blocks) {
++function taggedCandidates(text, blocks, toolDefinitions) {
+     const calls = [];
+     const artifacts = [];
+     for (const block of blocks) {
+@@ -170,7 +211,7 @@ function taggedCandidates(text, blocks) {
+         const objects = collectJsonObjects(body, Boolean(name));
+         let valid = false;
+         for (const object of objects) {
+-            const payload = callPayload(object.value, name);
++            const payload = callPayload(object.value, name, toolDefinitions);
+             if (!payload)
+                 continue;
+             valid = true;
+@@ -182,7 +223,7 @@ function taggedCandidates(text, blocks) {
+     }
+     return { calls, artifacts };
+ }
+-function directTaggedCandidates(text) {
++function directTaggedCandidates(text, toolDefinitions) {
+     DIRECT_TOOL_BLOCK.lastIndex = 0;
+     const calls = [];
+     const artifacts = [];
+@@ -206,7 +247,7 @@ function directTaggedCandidates(text) {
+                 !("arguments" in object.value);
+             const payload = isArgumentsObject
+                 ? { name, arguments: object.value }
+-                : callPayload(object.value, name);
++                : callPayload(object.value, name, toolDefinitions);
+             if (!payload)
+                 continue;
+             valid = true;
+@@ -236,20 +277,23 @@ function looseParameterCandidate(text) {
+     };
+ }
+ /** Parse model tool-call text into OpenAI-compatible calls and cleaned content. */
+-export function parseToolCalls(text, seed = "tool") {
++export function parseToolCalls(text, seed = "tool", toolDefinitions = []) {
+     const normalizedText = withoutWrapperTags(text);
+     const blocks = tagBlocks(normalizedText);
+-    const tagged = taggedCandidates(normalizedText, blocks);
+-    const direct = directTaggedCandidates(normalizedText);
++    const tagged = taggedCandidates(normalizedText, blocks, toolDefinitions);
++    const direct = directTaggedCandidates(normalizedText, toolDefinitions);
+     const blocked = [...blocks, ...direct.blocks];
+-    const bareObjects = collectJsonObjects(normalizedText).filter((object) => !overlaps({ start: object.start, end: object.end }, blocked));
++    const bareObjects = collectJsonObjects(normalizedText, /^\s*\{/.test(normalizedText)).filter((object) => !overlaps({ start: object.start, end: object.end }, blocked));
+     const bareRanges = bareObjects
+-        .filter((object) => looksLikeToolJson(object.raw))
++        .filter((object) => looksLikeToolJson(object.raw) ||
++        (normalizedToolDefinitions(toolDefinitions).length > 0 &&
++            isRecord(object.value) &&
++            isRecord(object.value.arguments)))
+         .map((object) => ({ start: object.start, end: object.end }));
+     const bareContext = protocolOnly(normalizedText, [...blocked, ...bareRanges]);
+     const bareCalls = bareContext
+         ? bareObjects.flatMap((object) => {
+-            const payload = callPayload(object.value);
++            const payload = callPayload(object.value, "", toolDefinitions);
+             return payload
+                 ? [{ order: object.start, consume: { start: object.start, end: object.end }, payload }]
+                 : [];
+@@ -283,11 +327,11 @@ export function parseToolCalls(text, seed = "tool") {
+     return { content: cleaned, toolCalls };
+ }
+ /** Prefer valid output calls, then promote calls leaked into reasoning. */
+-export function parseToolCallsFromParts(outputText, reasoningText, seed = "tool") {
+-    const fromOutput = parseToolCalls(outputText, seed);
++export function parseToolCallsFromParts(outputText, reasoningText, seed = "tool", toolDefinitions = []) {
++    const fromOutput = parseToolCalls(outputText, seed, toolDefinitions);
+     if (fromOutput.toolCalls.length > 0)
+         return fromOutput;
+-    const fromReasoning = parseToolCalls(reasoningText, seed);
++    const fromReasoning = parseToolCalls(reasoningText, seed, toolDefinitions);
+     if (fromReasoning.toolCalls.length > 0) {
+         return { content: fromOutput.content, toolCalls: fromReasoning.toolCalls };
+     }
+diff --git a/vendor/deepseek-web-api/dist/deepseek/toolOutcome.d.ts b/vendor/deepseek-web-api/dist/deepseek/toolOutcome.d.ts
+index 3eac6f1..3ae1623 100644
+--- a/vendor/deepseek-web-api/dist/deepseek/toolOutcome.d.ts
++++ b/vendor/deepseek-web-api/dist/deepseek/toolOutcome.d.ts
+@@ -10,5 +10,5 @@ export interface ToolTurnOutcome {
+     emptyUpstream: boolean;
+ }
+ /** Promote reasoning-only prose, preserve tool calls, and identify responses that need one retry. */
+-export declare function resolveToolTurn(outputText: string, reasoningText: string, idSeed: string, emptyFallback?: string): ToolTurnOutcome;
++export declare function resolveToolTurn(outputText: string, reasoningText: string, idSeed: string, emptyFallback?: string, toolDefinitions?: unknown[]): ToolTurnOutcome;
+ //# sourceMappingURL=toolOutcome.d.ts.map
+diff --git a/vendor/deepseek-web-api/dist/deepseek/toolOutcome.js b/vendor/deepseek-web-api/dist/deepseek/toolOutcome.js
+index 5009f5e..5fc36ff 100644
+--- a/vendor/deepseek-web-api/dist/deepseek/toolOutcome.js
++++ b/vendor/deepseek-web-api/dist/deepseek/toolOutcome.js
+@@ -5,8 +5,8 @@ function hasMalformedToolProtocol(text) {
+         /<\s*[^>]*\bname\s*=\s*["'][^"']+["'][^>]*>/i.test(text);
+ }
+ /** Promote reasoning-only prose, preserve tool calls, and identify responses that need one retry. */
+-export function resolveToolTurn(outputText, reasoningText, idSeed, emptyFallback = "") {
+-    const parsed = parseToolCallsFromParts(outputText, reasoningText, idSeed);
++export function resolveToolTurn(outputText, reasoningText, idSeed, emptyFallback = "", toolDefinitions = []) {
++    const parsed = parseToolCallsFromParts(outputText, reasoningText, idSeed, toolDefinitions);
+     let content = parsed.content;
+     let promotedReasoning = false;
+     if (parsed.toolCalls.length === 0 &&

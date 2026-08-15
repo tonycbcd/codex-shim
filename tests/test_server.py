@@ -163,7 +163,10 @@ def test_deepseek_context_keeps_current_task_and_compacts_optional_tools():
 
     sanitized = _sanitize_deepseek_body(body)
 
-    assert len(sanitized["input"]) == 3
+    assert len(sanitized["input"]) == 4
+    assert sanitized["input"][0]["content"] == "old task"
+    assert all(item.get("call_id") != "old" for item in sanitized["input"])
+    assert "Do not end while an update_plan item is still in_progress" in sanitized["instructions"]
     assert all(item.get("type") != "reasoning" for item in sanitized["input"])
     assert [tool["name"] for tool in sanitized["tools"]] == [
         "exec_command",
@@ -187,6 +190,84 @@ def test_deepseek_context_keeps_previous_task_for_continue_message():
 
     assert sanitized["input"][0]["content"] == "repair the routing bug"
     assert sanitized["input"][-1]["content"] == "继续修复"
+
+
+def test_deepseek_context_walks_past_consecutive_continue_messages():
+    body = {
+        "input": [
+            {"role": "user", "content": "repair the HRL scheduler in /opt/codes/ms/HRL"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "result"},
+            {"role": "user", "content": "继续修复"},
+            {"role": "assistant", "content": "still working"},
+            {"role": "user", "content": "重试"},
+        ],
+        "tools": [],
+    }
+
+    sanitized = _sanitize_deepseek_body(body)
+
+    assert sanitized["input"][0]["content"] == "repair the HRL scheduler in /opt/codes/ms/HRL"
+    assert sanitized["input"][-1]["content"] == "重试"
+
+
+def test_deepseek_context_keeps_recent_dialogue_for_followup_question():
+    body = {
+        "input": [
+            {"role": "user", "content": "Here is the OpenSearch DSL: must_not Username.keyword"},
+            {"type": "function_call", "call_id": "old", "name": "exec_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "old", "output": "large old output"},
+            {
+                "role": "assistant",
+                "content": "[deepseek-pro] Use a lowercase normalizer on Username.keyword.",
+            },
+            {"role": "user", "content": "我测试了，还是不行"},
+        ],
+        "tools": [],
+    }
+
+    sanitized = _sanitize_deepseek_body(body)
+
+    assert [item.get("role") for item in sanitized["input"]] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert sanitized["input"][0]["content"].startswith("Here is the OpenSearch DSL")
+    assert sanitized["input"][1]["content"] == (
+        "Use a lowercase normalizer on Username.keyword."
+    )
+    assert sanitized["input"][2]["content"] == "我测试了，还是不行"
+
+
+def test_deepseek_context_keeps_at_most_six_recent_user_turns():
+    body = {
+        "input": [
+            item
+            for index in range(8)
+            for item in (
+                {"role": "user", "content": f"user-{index}"},
+                {"role": "assistant", "content": f"assistant-{index}"},
+            )
+        ]
+        + [{"role": "user", "content": "latest followup"}],
+        "tools": [],
+    }
+
+    sanitized = _sanitize_deepseek_body(body)
+    user_messages = [
+        item["content"]
+        for item in sanitized["input"]
+        if item.get("role") == "user"
+    ]
+
+    assert user_messages == [
+        "user-3",
+        "user-4",
+        "user-5",
+        "user-6",
+        "user-7",
+        "latest followup",
+    ]
 
 
 def test_custom_tool_input_unwraps_freeform_envelope():
