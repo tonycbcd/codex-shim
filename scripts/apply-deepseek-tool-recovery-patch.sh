@@ -29,3 +29,7 @@ apply_patch_once \
   patches/deepseek-tool-inference.patch \
   "function inferredToolName" \
   vendor/deepseek-web-api/dist/deepseek/toolCalls.js
+apply_patch_once \
+  patches/deepseek-malformed-opening-tag.patch \
+  "function normalizeMalformedOpeningTags" \
+  vendor/deepseek-web-api/dist/deepseek/toolCalls.js

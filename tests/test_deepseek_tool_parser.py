@@ -43,6 +43,23 @@ def test_deepseek_parser_accepts_invoke_parameter_protocol():
     }
 
 
+def test_deepseek_parser_recovers_tool_call_missing_opening_angle_bracket():
+    calls = ShimServer._recover_deepseek_tool_calls(
+        """
+tool_call>
+{"arguments":{"cmd":"sed -n '1,120p' server.py","workdir":"/tmp"},"name":"exec_command"}
+</tool_call>
+"""
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "exec_command"
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "cmd": "sed -n '1,120p' server.py",
+        "workdir": "/tmp",
+    }
+
+
 def test_deepseek_parser_ignores_repeated_empty_wrappers():
     assert ShimServer._recover_deepseek_tool_calls(
         "<_calls>\n<tool_calls>\n<tool_calls>\n<tool_calls>"
@@ -120,5 +137,6 @@ def test_shim_detects_all_known_malformed_deepseek_xml_variants():
         "<tool_calls>",
         '<invoke name="exec_command">',
         '<parameter name="cmd">',
+        "tool_call>",
     ):
         assert ShimServer._is_malformed_tool_call(text)

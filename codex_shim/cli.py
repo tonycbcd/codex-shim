@@ -40,6 +40,7 @@ from .settings import (
     chatgpt_passthrough_slugs,
     default_model_slug,
     is_chatgpt_passthrough_slug,
+    resolve_chatgpt_passthrough_slug,
     usable_byok_models,
     byok_model_has_credentials,
 )
@@ -1215,9 +1216,7 @@ def _resolve_model_slug(models, requested: str | None, router_config=None) -> st
                 "ChatGPT passthrough requires a Codex login. "
                 "Run `codex login` so ~/.codex/auth.json contains tokens.access_token."
             )
-        if requested.startswith("openai-gpt-"):
-            return CHATGPT_MODEL_SLUG
-        return requested
+        return resolve_chatgpt_passthrough_slug(requested)
     if is_cursor_passthrough_slug(requested):
         if not cursor_passthrough_available():
             raise SystemExit(

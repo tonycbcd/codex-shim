@@ -1,0 +1,22 @@
+diff --git a/vendor/deepseek-web-api/dist/deepseek/toolCalls.js b/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
+--- a/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
++++ b/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
+@@ -137,6 +137,9 @@ function withoutWrapperTags(text) {
+     TOOL_WRAPPER_TAG.lastIndex = 0;
+     return text.replace(TOOL_WRAPPER_TAG, "");
+ }
++function normalizeMalformedOpeningTags(text) {
++    return text.replace(/^(\s*)(tool[_-]?call|_?call|invoke)\b([^<>\n]*)>/gim, "$1<$2$3>");
++}
+ function tagBlocks(text) {
+     TOOL_TAG.lastIndex = 0;
+     const tags = [...text.matchAll(TOOL_TAG)].map((match) => ({
+@@ -280,7 +283,7 @@ function looseParameterCandidate(text) {
+ }
+ /** Parse model tool-call text into OpenAI-compatible calls and cleaned content. */
+ export function parseToolCalls(text, seed = "tool", toolDefinitions = []) {
+-    const normalizedText = withoutWrapperTags(text);
++    const normalizedText = withoutWrapperTags(normalizeMalformedOpeningTags(text));
+     const blocks = tagBlocks(normalizedText);
+     const tagged = taggedCandidates(normalizedText, blocks, toolDefinitions);
+     const direct = directTaggedCandidates(normalizedText, toolDefinitions);

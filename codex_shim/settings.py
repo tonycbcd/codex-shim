@@ -155,16 +155,31 @@ def is_chatgpt_passthrough_slug(slug: str, cache_path: Path | None = None) -> bo
     return slug in chatgpt_passthrough_slugs(cache_path)
 
 
-def chatgpt_upstream_model(slug: str, cache_path: Path | None = None) -> str:
-    if slug.startswith("openai-gpt-"):
-        return CHATGPT_MODEL_SLUG
-    if slug in chatgpt_passthrough_slugs(cache_path):
+def resolve_chatgpt_passthrough_slug(slug: str, cache_path: Path | None = None) -> str:
+    """Resolve a public/legacy ChatGPT model name to the exact upstream slug.
+
+    Older Codex clients expose model IDs such as ``openai-gpt-5-5`` while the
+    ChatGPT backend expects ``gpt-5.5``.  Preserve unknown legacy aliases as a
+    compatibility fallback, but never collapse a known alias to the default
+    model because that silently routes requests to the wrong model.
+    """
+    available = chatgpt_passthrough_slugs(cache_path)
+    if slug in available:
         return slug
+    if slug.startswith("openai-"):
+        legacy = slug[len("openai-") :]
+        matches = [candidate for candidate in available if candidate.replace(".", "-") == legacy]
+        if len(matches) == 1:
+            return matches[0]
     return CHATGPT_MODEL_SLUG
 
 
+def chatgpt_upstream_model(slug: str, cache_path: Path | None = None) -> str:
+    return resolve_chatgpt_passthrough_slug(slug, cache_path)
+
+
 def slugify(value: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9.]+", "-", value.strip().lower()).strip("-")
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "model"
 
 

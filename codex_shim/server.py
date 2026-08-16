@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import html
 import json
+import os
 import re
 import secrets
+import signal
 import sys
 import time
 import uuid
@@ -64,18 +67,65 @@ PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
 # DeepSeek Web API configuration
 DEEPSEEK_API_BASE = "http://127.0.0.1:8766"
 DEEPSEEK_API_KEY_FILE = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / ".api-key"
+DEEPSEEK_RUN_SCRIPT = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / "run.sh"
+DEEPSEEK_LOG_FILE = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / "server.log"
 DEEPSEEK_MODEL_STANDARD = "deepseek-v4-flash"
 DEEPSEEK_MODEL_PRO = "deepseek-v4-pro"
+DEFAULT_CLAUDE_GATEWAY_URL = "http://127.0.0.1:8901/v1/chat/completions"
+# Keep the default on a model the current Kiro subscription can actually use.
+# claude-opus-4.6 returns 400 "Invalid model ID or insufficient subscription
+# level" on this account, which is why default shim->Kiro requests failed.
+DEFAULT_CLAUDE_GATEWAY_MODEL = "claude-sonnet-4.6"
 
 
 
 class ShimServer:
     def __init__(self, settings_path: Path = DEFAULT_SETTINGS, host: str = DEFAULT_HOST):
-        self.settings = ModelSettings(settings_path)
-        self.host = host
-        self.timeout = ClientTimeout(total=None, sock_connect=30, sock_read=None)
-        self.picker_token = secrets.token_urlsafe(32)
-        self._session: ClientSession | None = None
+       self.settings = ModelSettings(settings_path)
+       self.host = host
+       self.timeout = ClientTimeout(total=None, sock_connect=30, sock_read=None)
+       self.picker_token = secrets.token_urlsafe(32)
+       self._session: ClientSession | None = None
+       self._deepseek_lock = asyncio.Lock()
+       self._deepseek_users = 0
+       self._deepseek_process: asyncio.subprocess.Process | None = None
+       self._deepseek_log_handle: Any | None = None
+       self._deepseek_idle_handle: asyncio.TimerHandle | None = None
+       self._deepseek_idle_seconds: float = 30.0
+       self._session_platforms: dict[str, str] = {}
+
+    def _resolve_session_platform(
+        self,
+        request: web.Request,
+        explicit_platform: str | None,
+    ) -> str | None:
+        """Keep an explicit platform choice stable for the Codex session.
+
+        Codex preserves ``session_id`` across automatic context compaction,
+        while the compacted input no longer contains the original
+        ``[chatgpt]`` prefix. Remembering the explicit choice by session keeps
+        the compact request and all following turns on the same platform.
+        """
+        session_id = str(request.headers.get("session_id") or "").strip()
+        if explicit_platform:
+            if session_id:
+                if (
+                    session_id not in self._session_platforms
+                    and len(self._session_platforms) >= 1024
+                ):
+                    self._session_platforms.pop(next(iter(self._session_platforms)))
+                self._session_platforms[session_id] = explicit_platform
+            return explicit_platform
+        if not session_id:
+            return None
+        platform = self._session_platforms.get(session_id)
+        if platform:
+            print(
+                f"[shim] Reusing session platform: [{platform}] "
+                f"session_id={session_id}",
+                flush=True,
+            )
+        return platform
 
     async def _get_session(self) -> ClientSession:
         """Return a persistent ClientSession with connection pooling."""
@@ -115,7 +165,98 @@ class ShimServer:
         app.router.add_get("/picker", self.picker_page)
         app.router.add_get("/api/models", self.api_models)
         app.router.add_post("/api/switch", self.switch_model)
+        app.on_cleanup.append(self._cleanup)
         return app
+
+    async def _cleanup(self, _app: web.Application) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+        await self._stop_deepseek_service()
+
+    async def _deepseek_healthcheck(self) -> bool:
+        timeout = ClientTimeout(total=1)
+        try:
+            async with ClientSession(timeout=timeout) as session:
+                async with session.get(f"{DEEPSEEK_API_BASE}/health") as response:
+                    return response.status < 500
+        except Exception:
+            return False
+
+    async def _start_deepseek_service(self) -> None:
+        process = self._deepseek_process
+        if process is not None and process.returncode is None:
+            return
+        if not DEEPSEEK_RUN_SCRIPT.is_file():
+            raise RuntimeError(f"DeepSeek launcher not found: {DEEPSEEK_RUN_SCRIPT}")
+
+        DEEPSEEK_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self._deepseek_log_handle = DEEPSEEK_LOG_FILE.open("ab", buffering=0)
+        self._deepseek_process = await asyncio.create_subprocess_exec(
+            str(DEEPSEEK_RUN_SCRIPT),
+            stdout=self._deepseek_log_handle,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            process = self._deepseek_process
+            if process is None or process.returncode is not None:
+                code = None if process is None else process.returncode
+                await self._stop_deepseek_service()
+                raise RuntimeError(f"DeepSeek Web API exited during startup (code={code})")
+            if await self._deepseek_healthcheck():
+                print(f"[shim] DeepSeek Web API started on demand pid={process.pid}", flush=True)
+                return
+            await asyncio.sleep(0.25)
+
+        await self._stop_deepseek_service()
+        raise RuntimeError("DeepSeek Web API did not become healthy within 20 seconds")
+
+    async def _stop_deepseek_service(self) -> None:
+        process = self._deepseek_process
+        self._deepseek_process = None
+        if process is not None and process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            print(f"[shim] DeepSeek Web API stopped after request pid={process.pid}", flush=True)
+        if self._deepseek_log_handle is not None:
+            self._deepseek_log_handle.close()
+            self._deepseek_log_handle = None
+
+    async def _acquire_deepseek_service(self) -> None:
+        async with self._deepseek_lock:
+            # Cancel any pending idle-stop timer
+            if self._deepseek_idle_handle is not None:
+                self._deepseek_idle_handle.cancel()
+                self._deepseek_idle_handle = None
+            if self._deepseek_users == 0:
+                await self._start_deepseek_service()
+            self._deepseek_users += 1
+
+    async def _release_deepseek_service(self) -> None:
+        async with self._deepseek_lock:
+            self._deepseek_users = max(0, self._deepseek_users - 1)
+            if self._deepseek_users == 0:
+                # Schedule stop after idle timeout instead of stopping immediately
+                self._deepseek_idle_handle = asyncio.get_event_loop().call_later(
+                    self._deepseek_idle_seconds, lambda: asyncio.ensure_future(self._idle_stop_deepseek())
+                )
+
+    async def _idle_stop_deepseek(self) -> None:
+        async with self._deepseek_lock:
+            if self._deepseek_users == 0:
+                await self._stop_deepseek_service()
 
     async def picker_page(self, _request: web.Request) -> web.Response:
         return web.Response(text=_picker_html(self.picker_token), content_type="text/html")
@@ -278,7 +419,8 @@ class ShimServer:
         requested_platform = str(body.pop("first_platform", "") or "").strip().lower()
         # first_platform is an explicit per-request routing decision and must
         # override prefixes retained in older conversation history.
-        platform = requested_platform or prefix_platform or None
+        explicit_platform = requested_platform or prefix_platform or None
+        platform = self._resolve_session_platform(request, explicit_platform)
         if platform:
             print(f"[shim] Platform prefix detected: [{platform}]", flush=True)
             if platform == "deepseek":
@@ -298,75 +440,145 @@ class ShimServer:
                     return await self._chatgpt_passthrough(request, body)
                 else:
                     print("[shim] ⚠️  ChatGPT not available, falling back to Claude", flush=True)
+            elif platform in {"claud", "claude", "kiro"}:
+                pass
+            else:
+                print(
+                    f"[shim] Unknown platform [{platform}], using default Claude gateway",
+                    flush=True,
+                )
+
         model = str(body.get("model") or "")
-        if is_chatgpt_passthrough_slug(model) and chatgpt_passthrough_available():
-            upstream = chatgpt_upstream_model(model)
-            override = model if model != upstream else None
-            return await self._chatgpt_passthrough(
-                request,
-                body,
-                response_model_override=override,
-                upstream_model=upstream,
-            )
-        if is_chatgpt_passthrough_slug(model) and not chatgpt_passthrough_available():
-            print(f"[shim] ⚠️  ChatGPT passthrough unavailable (no valid auth.json), using OpenAI API for {model}", flush=True)
-            return await self._openai_api_fallback(request, body, response_model_override=model)
-        if is_cursor_passthrough_slug(model):
-            return await self._cursor_passthrough(
-                request,
-                body,
-                response_model_override=model,
-                upstream_model=cursor_upstream_model(model),
-            )
-        if self._needs_image_gen(body) or self._needs_image_followup(body):
-            return await self._chatgpt_passthrough(request, body, response_model_override=model)
-        route = self._route(body)
-        if route.is_openai_chat:
-            forwarded = responses_to_chat(body, route.model)
-            return await self._post_openai_chat(request, route, forwarded, as_responses=True)
-        if route.is_anthropic:
-            forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
-            return await self._post_anthropic(request, route, forwarded, as_responses=True)
-        raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+        if not is_chatgpt_passthrough_slug(model):
+            if is_cursor_passthrough_slug(model):
+                return await self._cursor_passthrough(
+                    request,
+                    body,
+                    response_model_override=model,
+                    upstream_model=cursor_upstream_model(model),
+                )
+            if self._needs_image_gen(body) or self._needs_image_followup(body):
+                return await self._chatgpt_passthrough(request, body, response_model_override=model)
+            route = self._route(body)
+            if route.is_openai_chat:
+                forwarded = responses_to_chat(body, route.model)
+                return await self._post_openai_chat(request, route, forwarded, as_responses=True)
+            if route.is_anthropic:
+                forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
+                return await self._post_anthropic(request, route, forwarded, as_responses=True)
+            raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+
+        # Claude/Kiro is the default platform. A ChatGPT model slug selected
+        # in the Codex UI must not silently opt into ChatGPT Web; only the
+        # explicit [chatgpt] prefix or first_platform=chatgpt may do that.
+        print("[shim] Routing request to default Claude gateway", flush=True)
+        claude_result = await self._claude_gateway_fallback(
+            request,
+            body,
+            response_model_override=DEFAULT_CLAUDE_GATEWAY_MODEL,
+        )
+        if claude_result is not None:
+            return claude_result
+        raise web.HTTPBadGateway(text="Claude gateway on port 8901 is unavailable")
 
     async def responses_compact(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         _log_incoming_request("/v1/responses/compact", body)
         body = await self._maybe_apply_auto_router(body)
-        model = str(body.get("model") or "")
-        if is_chatgpt_passthrough_slug(model) and chatgpt_passthrough_available():
+        body, prefix_platform = _check_and_strip_platform_prefix(body)
+        requested_platform = str(body.pop("first_platform", "") or "").strip().lower()
+        explicit_platform = requested_platform or prefix_platform or None
+        platform = self._resolve_session_platform(request, explicit_platform)
+        if platform == "chatgpt" and chatgpt_passthrough_available():
+            model = str(body.get("model") or CHATGPT_MODEL_SLUG)
             upstream = chatgpt_upstream_model(model)
             return await self._chatgpt_compact_passthrough(request, body, upstream_model=upstream)
-        if is_chatgpt_passthrough_slug(model) and not chatgpt_passthrough_available():
-            print(f"[shim] ⚠️  ChatGPT passthrough unavailable for compact, using OpenAI API for {model}", flush=True)
-            return await self._openai_api_fallback(request, body, response_model_override=model)
-        if is_cursor_passthrough_slug(model):
-            compact_body = dict(body)
-            compact_body["input"] = body.get("input") or []
-            compact_body["instructions"] = (
-                f"{body.get('instructions') or ''}\n\nSummarize the conversation above into a compact "
-                "context window suitable for continuing the task."
-            ).strip()
-            return await self._cursor_passthrough(
-                request,
-                compact_body,
-                response_model_override=model,
-                upstream_model=cursor_upstream_model(model),
-                force_non_stream=True,
+        if platform == "chatgpt":
+            print("[shim] ChatGPT compact unavailable; using default Claude gateway", flush=True)
+        model = str(body.get("model") or "")
+        if not is_chatgpt_passthrough_slug(model):
+            if is_cursor_passthrough_slug(model):
+                compact_body = dict(body)
+                compact_body["input"] = body.get("input") or []
+                compact_body["instructions"] = (
+                    f"{body.get('instructions') or ''}\n\nSummarize the conversation above into a compact "
+                    "context window suitable for continuing the task."
+                ).strip()
+                return await self._cursor_passthrough(
+                    request,
+                    compact_body,
+                    response_model_override=model,
+                    upstream_model=cursor_upstream_model(model),
+                    force_non_stream=True,
+                )
+            route = self._route(body)
+            compact_body = _compact_request_body(body, route.model)
+            if route.is_openai_chat:
+                forwarded = responses_to_chat(compact_body, route.model)
+                forwarded["stream"] = False
+                response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
+                return await _as_compact_response(response, route.slug)
+            if route.is_anthropic:
+                forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
+                forwarded["stream"] = False
+                response = await self._post_anthropic(request, route, forwarded, as_responses=True)
+                return await _as_compact_response(response, route.slug)
+            raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+        return await self._claude_gateway_compact(body)
+
+    async def _claude_gateway_compact(self, body: dict[str, Any]) -> web.Response:
+        """Compact context through the default Kiro/Claude gateway."""
+        claude_url = os.environ.get(
+            "CLAUDE_GATEWAY_URL",
+            DEFAULT_CLAUDE_GATEWAY_URL,
+        ).strip()
+        claude_key = os.environ.get(
+            "CLAUDE_GATEWAY_API_KEY",
+            os.environ.get("CODEX_SHIM_FALLBACK_KEY", "my-super-secret-password-123"),
+        )
+        claude_model = os.environ.get(
+            "CLAUDE_GATEWAY_MODEL",
+            DEFAULT_CLAUDE_GATEWAY_MODEL,
+        ).strip()
+        compact_body = _compact_request_body(body, claude_model)
+        chat_body = responses_to_chat(compact_body, claude_model)
+        chat_body["stream"] = False
+        headers = {
+            "Authorization": f"Bearer {claude_key}",
+            "Content-Type": "application/json",
+        }
+        session = await self._get_session()
+        try:
+            import asyncio
+
+            upstream = await asyncio.wait_for(
+                session.post(claude_url, json=chat_body, headers=headers),
+                timeout=90,
             )
-        route = self._route(body)
-        compact_body = _compact_request_body(body, route.model)
-        if route.is_openai_chat:
-            forwarded = responses_to_chat(compact_body, route.model)
-            forwarded["stream"] = False
-            response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
-            return await _as_compact_response(response, route.slug)
-        if route.is_anthropic:
-            forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
-            forwarded["stream"] = False
-            response = await self._post_anthropic(request, route, forwarded, as_responses=True)
-            return await _as_compact_response(response, route.slug)
-        raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+        except Exception as exc:
+            raise web.HTTPBadGateway(text=f"Claude compact request failed: {exc}") from exc
+        try:
+            if upstream.status >= 400:
+                error_text = await upstream.text()
+                raise web.HTTPBadGateway(
+                    text=f"Claude compact request returned {upstream.status}: {error_text[:200]}"
+                )
+            payload = await upstream.json(content_type=None)
+        finally:
+            upstream.release()
+        response_payload = chat_completion_to_response(
+            payload,
+            claude_model,
+            _build_tool_types(compact_body),
+        )
+        summary = _compact_summary_from_output(response_payload.get("output"))
+        return web.json_response(
+            _compact_response_payload(
+                claude_model,
+                summary,
+                response_payload.get("usage"),
+            )
+        )
 
     def _needs_image_gen(self, body: dict[str, Any]) -> bool:
         tools = body.get("tools") or []
@@ -573,6 +785,9 @@ class ShimServer:
         import os
         FALLBACK_TIMEOUT = int(os.environ.get("CODEX_SHIM_FALLBACK_TIMEOUT", "60"))
         session = await self._get_session()
+        response = _sse_response()
+        await response.prepare(request)
+        await _safe_write(response, b": codex-shim connected\n\n")
 
         # Two-stage ChatGPT attempt: first gpt-5.6-sol, then original client model
         # Fallback models will be added dynamically if "at capacity" error is detected
@@ -593,8 +808,9 @@ class ShimServer:
             upstream = None
             for attempt in range(max_retries):
                 try:
-                    upstream = await _asyncio.wait_for(
+                    upstream = await _await_with_sse_heartbeats(
                         session.post(url, json=forwarded, headers=headers),
+                        response,
                         timeout=FALLBACK_TIMEOUT,
                     )
                 except _asyncio.TimeoutError:
@@ -665,11 +881,21 @@ class ShimServer:
             timed_out = True
 
         if timed_out:
-            claude_result = await self._claude_gateway_fallback(request, body, response_model_override)
+            claude_result = await self._claude_gateway_fallback(
+                request,
+                body,
+                response_model_override,
+                prepared_response=response,
+            )
             if claude_result is not None:
                 return claude_result
             print(f"[shim] Claude gateway also failed, switching to OpenAI API fallback", flush=True)
-            return await self._openai_api_fallback(request, body, response_model_override)
+            return await self._openai_api_fallback(
+                request,
+                body,
+                response_model_override,
+                prepared_response=response,
+            )
 
 
 
@@ -742,8 +968,9 @@ class ShimServer:
                     try_model = models_to_try[model_idx]
                     # Reset and retry with new model
                     session = await self._get_session()
-                    upstream = await _asyncio.wait_for(
+                    upstream = await _await_with_sse_heartbeats(
                         session.post(url, json=forwarded, headers=headers),
+                        response,
                         timeout=FALLBACK_TIMEOUT,
                     )
                     if upstream.status == 200:
@@ -780,15 +1007,23 @@ class ShimServer:
 
                 if stream_error_detected:
                     # All models failed, try Claude gateway
-                    claude_result = await self._claude_gateway_fallback(request, body, response_model_override)
+                    claude_result = await self._claude_gateway_fallback(
+                        request,
+                        body,
+                        response_model_override,
+                        prepared_response=response,
+                    )
                     if claude_result is not None:
                         return claude_result
                     print(f"[shim] Claude gateway also failed, switching to OpenAI API fallback", flush=True)
-                    return await self._openai_api_fallback(request, body, response_model_override)
+                    return await self._openai_api_fallback(
+                        request,
+                        body,
+                        response_model_override,
+                        prepared_response=response,
+                    )
 
             # No error — prepare response and flush buffered lines
-            response = _sse_response()
-            await response.prepare(request)
             _source_injected = False
             # Determine source tag: show model name if using a fallback
             _source_tag = "[ChatGPT]" if try_model == CHATGPT_MODEL_SLUG else f"[ChatGPT {try_model}]"
@@ -870,8 +1105,9 @@ class ShimServer:
                     try_model = models_to_try[model_idx]
                     session = await self._get_session()
                     try:
-                        upstream = await _asyncio.wait_for(
+                        upstream = await _await_with_sse_heartbeats(
                             session.post(url, json=forwarded, headers=headers),
+                            response,
                             timeout=FALLBACK_TIMEOUT,
                         )
                         if upstream.status == 200:
@@ -893,14 +1129,22 @@ class ShimServer:
 
                 if not first_chunk:
                     # All models failed, try Claude gateway
-                    claude_result = await self._claude_gateway_fallback(request, body, response_model_override)
+                    claude_result = await self._claude_gateway_fallback(
+                        request,
+                        body,
+                        response_model_override,
+                        prepared_response=response,
+                    )
                     if claude_result is not None:
                         return claude_result
                     print(f"[shim] Claude gateway also failed (raw), switching to OpenAI API fallback", flush=True)
-                    return await self._openai_api_fallback(request, body, response_model_override)
+                    return await self._openai_api_fallback(
+                        request,
+                        body,
+                        response_model_override,
+                        prepared_response=response,
+                    )
 
-            response = _sse_response()
-            await response.prepare(request)
             try:
                 if first_chunk:
                     await _safe_write(response, first_chunk)
@@ -923,7 +1167,7 @@ class ShimServer:
         """Detect XML-like pseudo tool calls emitted as plain model text."""
         return bool(
             re.search(
-                r"<\s*(?:_?calls?|tool_?calls?|invoke|parameter)\b",
+                r"(?:<\s*|(?m:^\s*))(?:_?calls?|tool[_-]?calls?|invoke|parameter)\b[^>\n]*>",
                 text,
                 flags=re.IGNORECASE,
             )
@@ -961,10 +1205,18 @@ class ShimServer:
             return arguments or None
 
         calls: list[dict[str, Any]] = []
+        # DeepSeek occasionally omits only the opening ``<`` and emits
+        # ``tool_call> ... </tool_call>``. Repair it before parsing so the
+        # complete JSON payload is still treated as a structured tool call.
+        normalized_text = re.sub(
+            r"(?im)^(?P<indent>\s*)(?P<tag>tool[_-]?call|_?call|invoke)\b(?P<attrs>[^<>\n]*)>",
+            r"\g<indent><\g<tag>\g<attrs>>",
+            text,
+        )
         normalized_text = re.sub(
             r"<\s*/?\s*(?:tool[_-]?calls|_?calls)\b[^>]*>",
             "",
-            text,
+            normalized_text,
             flags=re.IGNORECASE,
         )
         direct_block = re.compile(
@@ -974,7 +1226,7 @@ class ShimServer:
         )
         for match in direct_block.finditer(normalized_text):
             tag = match.group("tag")
-            if re.fullmatch(r"(?:tool[_-]?calls?|_?calls?|parameter)", tag, re.IGNORECASE):
+            if re.fullmatch(r"(?:tool[_-]?calls|_?calls|parameter)", tag, re.IGNORECASE):
                 continue
             attributes = match.group("attrs")
             body_text = match.group("body").strip()
@@ -1185,6 +1437,53 @@ class ShimServer:
         body: dict[str, Any],
         path: str = "/v1/responses",
     ) -> web.StreamResponse:
+        """Run the heavy DeepSeek compatibility service only for this request."""
+        api_key = _get_deepseek_api_key()
+        if not api_key:
+            print("[shim] ⚠️  DeepSeek API key not found, falling back to Claude", flush=True)
+            return await self._claude_gateway_fallback(
+                request,
+                body,
+                response_model_override="deepseek",
+            ) or await self._openai_api_fallback(
+                request,
+                body,
+                response_model_override="deepseek",
+            )
+
+        try:
+            await self._acquire_deepseek_service()
+        except Exception as exc:
+            print(f"[shim] ⚠️  DeepSeek startup failed: {exc}, falling back to Claude", flush=True)
+            return await self._claude_gateway_fallback(
+                request,
+                body,
+                response_model_override="deepseek",
+            ) or await self._openai_api_fallback(
+                request,
+                body,
+                response_model_override="deepseek",
+            )
+
+        session = ClientSession(timeout=self.timeout)
+        try:
+            return await self._deepseek_passthrough_running(
+                request,
+                body,
+                session,
+                path=path,
+            )
+        finally:
+            await session.close()
+            await self._release_deepseek_service()
+
+    async def _deepseek_passthrough_running(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        session: ClientSession,
+        path: str = "/v1/responses",
+    ) -> web.StreamResponse:
         """Forward a Responses request to DeepSeek Web API.
 
         deepseek-web-api emulates function calling by prompting DeepSeek with
@@ -1221,7 +1520,6 @@ class ShimServer:
 
         del path  # Reserved for parity with other passthrough handlers.
         url = f"{DEEPSEEK_API_BASE}/v1/chat/completions"
-        session = await self._get_session()
         t0 = time.time()
 
         import asyncio as _asyncio
@@ -1331,6 +1629,16 @@ class ShimServer:
             content = message.get("content") or ""
             if isinstance(message.get("tool_calls"), list):
                 upstream_tool_calls = message["tool_calls"]
+        if content and not upstream_tool_calls and self._is_malformed_tool_call(content):
+            recovered_calls = self._recover_deepseek_tool_calls(content)
+            if recovered_calls:
+                print(
+                    f"[shim] Recovered {len(recovered_calls)} malformed DeepSeek "
+                    "tool call(s) from non-stream response",
+                    flush=True,
+                )
+                upstream_tool_calls = recovered_calls
+                content = ""
 
         # Build Responses API format response
         response_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -1391,47 +1699,69 @@ class ShimServer:
         request: web.Request,
         body: dict[str, Any],
         response_model_override: str | None = None,
+        prepared_response: web.StreamResponse | None = None,
     ) -> web.StreamResponse | None:
-        """Fallback to Claude via kiro-gateway (localhost:8000). Returns None if fails."""
-        CLAUDE_URL = "http://127.0.0.1:8000/v1/chat/completions"
-        CLAUDE_KEY = "my-super-secret-password-123"
-        CLAUDE_MODEL = "claude-opus-4.5"
+        """Fallback to Claude via kiro-gateway. Returns None if it fails."""
+        claude_url = os.environ.get(
+            "CLAUDE_GATEWAY_URL",
+            DEFAULT_CLAUDE_GATEWAY_URL,
+        ).strip()
+        claude_key = os.environ.get(
+            "CLAUDE_GATEWAY_API_KEY",
+            os.environ.get("CODEX_SHIM_FALLBACK_KEY", "my-super-secret-password-123"),
+        )
+        claude_model = os.environ.get(
+            "CLAUDE_GATEWAY_MODEL",
+            DEFAULT_CLAUDE_GATEWAY_MODEL,
+        ).strip()
 
-        chat_body = responses_to_chat(body, CLAUDE_MODEL)
+        chat_body = responses_to_chat(body, claude_model)
         chat_body["stream"] = True
         if not chat_body.get("tools") and "parallel_tool_calls" in chat_body:
             del chat_body["parallel_tool_calls"]
 
         headers = {
-            "Authorization": f"Bearer {CLAUDE_KEY}",
+            "Authorization": f"Bearer {claude_key}",
             "Content-Type": "application/json",
         }
 
         session = await self._get_session()
+        response = prepared_response or _sse_response()
+        if prepared_response is None and request is not None:
+            await response.prepare(request)
+            await _safe_write(response, b": codex-shim connected\n\n")
         t0 = time.time()
         try:
-            import asyncio as _asyncio
-            upstream = await _asyncio.wait_for(
-                session.post(CLAUDE_URL, json=chat_body, headers=headers),
-                timeout=90,
-            )
+            if request is None:
+                import asyncio
+
+                upstream = await asyncio.wait_for(
+                    session.post(claude_url, json=chat_body, headers=headers),
+                    timeout=90,
+                )
+            else:
+                upstream = await _await_with_sse_heartbeats(
+                    session.post(claude_url, json=chat_body, headers=headers),
+                    response,
+                    timeout=90,
+                )
         except Exception as e:
             print(f"[shim] Claude gateway failed: {e}", flush=True)
             return None
 
         t1 = time.time()
-        print(f"[shim] CLAUDE gateway status={upstream.status} elapsed={t1-t0:.2f}s model={CLAUDE_MODEL}", flush=True)
+        print(
+            f"[shim] CLAUDE gateway status={upstream.status} "
+            f"elapsed={t1-t0:.2f}s model={claude_model}",
+            flush=True,
+        )
 
         if upstream.status >= 400:
             err_text = await upstream.text()
             print(f"[shim] Claude gateway error: {err_text[:300]}", flush=True)
             return None
 
-        # Stream SSE back using ResponsesStreamState
-        response = _sse_response()
-        await response.prepare(request)
-
-        model_name = response_model_override or "claude-opus-4.6"
+        model_name = response_model_override or DEFAULT_CLAUDE_GATEWAY_MODEL
         tool_types = _build_tool_types(body)
         state = ResponsesStreamState(model_name, tool_types)
 
@@ -1478,6 +1808,7 @@ class ShimServer:
         request: web.Request,
         body: dict[str, Any],
         response_model_override: str | None = None,
+        prepared_response: web.StreamResponse | None = None,
     ) -> web.StreamResponse:
         """Fallback to OpenAI official API when ChatGPT passthrough fails."""
         import os
@@ -1486,6 +1817,22 @@ class ShimServer:
         OPENAI_MODEL = body.get("model") or os.environ.get("CODEX_SHIM_OPENAI_FALLBACK_MODEL", "gpt-5.6-sol")
 
         if not OPENAI_KEY:
+            if prepared_response is not None:
+                await _write_sse(
+                    prepared_response,
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "server_error",
+                            "message": "ChatGPT and Claude failed; no OPENAI_API_KEY is configured",
+                        },
+                    },
+                )
+                try:
+                    await prepared_response.write_eof()
+                except Exception:
+                    pass
+                return prepared_response
             raise web.HTTPServiceUnavailable(text="ChatGPT failed and no OPENAI_API_KEY set for fallback")
 
         # Convert responses-format to chat completions format
@@ -1519,8 +1866,9 @@ class ShimServer:
             raise web.HTTPServiceUnavailable(text=f"OpenAI API returned {upstream.status}: {err_text[:200]}")
 
         # Stream SSE back using ResponsesStreamState (handles text + tool_calls)
-        response = _sse_response()
-        await response.prepare(request)
+        response = prepared_response or _sse_response()
+        if prepared_response is None:
+            await response.prepare(request)
 
         model_name = response_model_override or "gpt-5.6-sol"
         tool_types = _build_tool_types(body)
@@ -2079,9 +2427,10 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
             return new_body, platform
         return body, None
 
-    # Handle list input. Codex resends the full conversation on every turn, so
-    # scan newest-to-oldest; otherwise an old [chatgpt] prefix permanently
-    # overrides a later [deepseek] / [deepseek-pro] selection.
+    # Handle list input. Codex resends the full conversation on every turn,
+    # but a platform prefix is a one-turn instruction: only inspect the latest
+    # user message. Reusing an older [chatgpt] prefix would make ChatGPT sticky
+    # and defeat the default Claude/Kiro route.
     if isinstance(input_data, list):
         for i in range(len(input_data) - 1, -1, -1):
             item = input_data[i]
@@ -2126,6 +2475,9 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
                         new_input[i] = new_item
                         new_body["input"] = new_input
                         return new_body, platform
+            # This is the latest user message. If it has no prefix, older
+            # messages must not influence routing for the current turn.
+            return body, None
 
     return body, None
 
@@ -2399,14 +2751,11 @@ def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
     if len(reasoning_indices) > 6:
         for idx in reasoning_indices[:-6]:
             item = input_items[idx]
-            # Replace reasoning content with minimal placeholder
-            if isinstance(item.get("content"), list):
-                item["content"] = [{"type": "input_text", "text": "..."}]
-            elif isinstance(item.get("content"), str):
-                item["content"] = "..."
-            # Also clear summary if present
+            # Responses API reasoning items only accept an empty content array.
+            # Adding an input_text placeholder makes the entire request invalid.
+            item["content"] = []
             if "summary" in item:
-                item["summary"] = [{"type": "summary_text", "text": "..."}]
+                item["summary"] = []
 
     # Truncate long tool outputs (older than last 10 items)
     MAX_OUTPUT_LEN = 3000
@@ -3530,6 +3879,40 @@ async def _safe_write(response: web.StreamResponse, data: bytes) -> None:
             "ClientPayloadError",
         }:
             raise ClientDisconnected() from exc
+        raise
+
+
+async def _await_with_sse_heartbeats(
+    awaitable: Any,
+    response: web.StreamResponse,
+    *,
+    timeout: float,
+    interval: float = 1.0,
+) -> Any:
+    """Keep Codex connected while a slow upstream request returns headers."""
+    import asyncio
+
+    task = asyncio.ensure_future(awaitable)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=min(interval, remaining),
+                )
+            except asyncio.TimeoutError:
+                if task.done():
+                    return task.result()
+                # SSE comments are ignored by Codex's event parser but count
+                # as response activity, preventing Reconnect 1..3 loops.
+                await _safe_write(response, b": codex-shim keep-alive\n\n")
+    except BaseException:
+        if not task.done():
+            task.cancel()
         raise
 
 

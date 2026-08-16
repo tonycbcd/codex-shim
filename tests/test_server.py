@@ -117,6 +117,43 @@ def test_sanitize_chatgpt_passthrough_body_keeps_old_reasoning_content_empty():
     ]
 
 
+async def test_claude_fallback_uses_configured_kiro_gateway(monkeypatch):
+    requested = {}
+
+    class FailedResponse:
+        status = 503
+
+        async def text(self):
+            return "test failure"
+
+    class FakeSession:
+        async def post(self, url, **kwargs):
+            requested["url"] = url
+            requested["headers"] = kwargs["headers"]
+            return FailedResponse()
+
+    shim = ShimServer()
+
+    async def fake_get_session():
+        return FakeSession()
+
+    monkeypatch.setattr(shim, "_get_session", fake_get_session)
+    monkeypatch.setenv(
+        "CLAUDE_GATEWAY_URL",
+        "http://127.0.0.1:18901/v1/chat/completions",
+    )
+    monkeypatch.setenv("CLAUDE_GATEWAY_API_KEY", "test-key")
+
+    result = await shim._claude_gateway_fallback(
+        None,
+        {"input": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert result is None
+    assert requested["url"] == "http://127.0.0.1:18901/v1/chat/completions"
+    assert requested["headers"]["Authorization"] == "Bearer test-key"
+
+
 def test_deepseek_malformed_tool_call_detection_is_case_insensitive():
     shim = ShimServer()
 
@@ -142,6 +179,21 @@ def test_platform_prefix_uses_newest_prefixed_user_message():
     assert platform == "deepseek-pro"
     assert stripped["input"][0]["content"][0]["text"] == "[chatgpt] old"
     assert stripped["input"][2]["content"][0]["text"] == "newest"
+
+
+def test_old_chatgpt_prefix_does_not_override_unprefixed_latest_turn():
+    body = {
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "[chatgpt] old"}]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "reply"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "latest"}]},
+        ]
+    }
+
+    stripped, platform = _check_and_strip_platform_prefix(body)
+
+    assert platform is None
+    assert stripped == body
 
 
 def test_deepseek_context_keeps_current_task_and_compacts_optional_tools():
@@ -305,6 +357,161 @@ async def test_responses_first_platform_deepseek_pro_selects_pro(monkeypatch, tm
     await shim_client.close()
 
 
+async def test_responses_defaults_to_claude_even_for_chatgpt_model(
+    monkeypatch,
+    tmp_path,
+    auth_present,
+):
+    captured = {}
+
+    async def claude(self, request, body, response_model_override=None, prepared_response=None):
+        captured["claude"] = body
+        captured["model"] = response_model_override
+        return web.json_response({"platform": "claude"})
+
+    async def chatgpt(*args, **kwargs):
+        pytest.fail("default request must not route to ChatGPT")
+
+    monkeypatch.setattr(ShimServer, "_claude_gateway_fallback", claude)
+    monkeypatch.setattr(ShimServer, "_chatgpt_passthrough", chatgpt)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.4", "input": "hi", "stream": True},
+    )
+
+    assert resp.status == 200
+    assert await resp.json() == {"platform": "claude"}
+    assert captured["model"] == "claude-sonnet-4.6"
+    await shim_client.close()
+
+
+@pytest.mark.parametrize(
+    "request_body",
+    [
+        {"model": "gpt-5.4", "input": "hi", "first_platform": "chatgpt"},
+        {"model": "gpt-5.4", "input": "[chatgpt] hi"},
+    ],
+)
+async def test_responses_only_explicit_chatgpt_routes_to_chatgpt(
+    monkeypatch,
+    tmp_path,
+    auth_present,
+    request_body,
+):
+    captured = {}
+
+    async def chatgpt(self, request, body, response_model_override=None, upstream_model=None):
+        captured["body"] = body
+        return web.json_response({"platform": "chatgpt"})
+
+    async def claude(*args, **kwargs):
+        pytest.fail("explicit ChatGPT request must not route to Claude")
+
+    monkeypatch.setattr(ShimServer, "_chatgpt_passthrough", chatgpt)
+    monkeypatch.setattr(ShimServer, "_claude_gateway_fallback", claude)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post("/v1/responses", json=request_body)
+
+    assert resp.status == 200
+    assert await resp.json() == {"platform": "chatgpt"}
+    assert "first_platform" not in captured["body"]
+    await shim_client.close()
+
+
+async def test_chatgpt_platform_survives_context_compaction(
+    monkeypatch,
+    tmp_path,
+    auth_present,
+):
+    routed = []
+
+    async def chatgpt(self, request, body, response_model_override=None, upstream_model=None):
+        routed.append(("responses", body))
+        return web.json_response({"platform": "chatgpt"})
+
+    async def compact(self, request, body, upstream_model=None):
+        routed.append(("compact", body))
+        return web.json_response(
+            {
+                "id": "resp_compact",
+                "status": "completed",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Context automatically compacted.",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    async def claude(*args, **kwargs):
+        pytest.fail("remembered ChatGPT session must not route to Claude")
+
+    monkeypatch.setattr(ShimServer, "_chatgpt_passthrough", chatgpt)
+    monkeypatch.setattr(ShimServer, "_chatgpt_compact_passthrough", compact)
+    monkeypatch.setattr(ShimServer, "_claude_gateway_fallback", claude)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    headers = {"session_id": "session-chatgpt-compact"}
+
+    first = await shim_client.post(
+        "/v1/responses",
+        headers=headers,
+        json={"model": "gpt-5.4", "input": "[chatgpt] fix the bug"},
+    )
+    compacted = await shim_client.post(
+        "/v1/responses/compact",
+        headers=headers,
+        json={
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": "fix the bug"}],
+        },
+    )
+    continued = await shim_client.post(
+        "/v1/responses",
+        headers=headers,
+        json={
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "role": "assistant",
+                    "content": "Context automatically compacted.",
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        },
+    )
+
+    assert first.status == 200
+    assert compacted.status == 200
+    assert continued.status == 200
+    assert [endpoint for endpoint, _body in routed] == [
+        "responses",
+        "compact",
+        "responses",
+    ]
+    assert routed[0][1]["input"] == "fix the bug"
+    await shim_client.close()
+
+
 def test_rewrite_response_model_only_rewrites_chatgpt_metadata():
     payload = {
         "model": "gpt-5.6-sol",
@@ -400,7 +607,7 @@ async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model
     await shim_client.close()
 
 
-async def test_responses_routes_to_openai_chat(tmp_path):
+async def test_chat_completions_routes_to_openai_chat(tmp_path):
     captured = {}
 
     async def chat(request):
@@ -438,11 +645,14 @@ async def test_responses_routes_to_openai_chat(tmp_path):
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
 
-    resp = await shim_client.post("/v1/responses", json={"model": "real-openai", "input": "hi"})
+    resp = await shim_client.post(
+        "/v1/chat/completions",
+        json={"model": "real-openai", "messages": [{"role": "user", "content": "hi"}]},
+    )
     assert resp.status == 200
     payload = await resp.json()
-    assert payload["output"][0]["content"][0]["text"] == "hello"
-    assert payload["usage"] == {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+    assert payload["choices"][0]["message"]["content"] == "hello"
+    assert payload["usage"] == {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
     assert captured["body"]["model"] == "real-openai"
     assert captured["headers"]["Authorization"] == "Bearer secret"
 
@@ -471,7 +681,10 @@ async def test_missing_api_key_env_has_model_specific_error(monkeypatch, tmp_pat
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
 
-    resp = await shim_client.post("/v1/responses", json={"model": "glm-5-1", "input": "hi"})
+    resp = await shim_client.post(
+        "/v1/chat/completions",
+        json={"model": "glm-5-1", "messages": [{"role": "user", "content": "hi"}]},
+    )
 
     assert resp.status == 401
     text = await resp.text()
@@ -605,7 +818,7 @@ async def test_streaming_anthropic_response_completed_includes_usage():
     }
 
 
-async def test_responses_compact_routes_to_openai_chat_and_returns_compacted_window(tmp_path):
+async def test_responses_compact_defaults_to_claude_gateway(monkeypatch, tmp_path):
     captured = {}
 
     async def chat(request):
@@ -623,29 +836,20 @@ async def test_responses_compact_routes_to_openai_chat_and_returns_compacted_win
     upstream_client = TestClient(TestServer(upstream))
     await upstream_client.start_server()
 
-    settings = tmp_path / "settings.json"
-    settings.write_text(
-        json.dumps(
-            {
-                "customModels": [
-                    {
-                        "model": "real-openai",
-                        "displayName": "Real OpenAI",
-                        "provider": "openai",
-                        "baseUrl": str(upstream_client.make_url("/v1")),
-                        "apiKey": "secret",
-                    }
-                ]
-            }
-        )
+    monkeypatch.setenv(
+        "CLAUDE_GATEWAY_URL",
+        str(upstream_client.make_url("/v1/chat/completions")),
     )
+    monkeypatch.setenv("CLAUDE_GATEWAY_API_KEY", "test-key")
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
 
     resp = await shim_client.post(
         "/v1/responses/compact",
         json={
-            "model": "real-openai",
+            "model": "gpt-5.4",
             "input": [
                 {"role": "user", "content": "implement compact"},
                 {"type": "function_call_output", "call_id": "call_1", "output": "tests pass"},
@@ -657,10 +861,10 @@ async def test_responses_compact_routes_to_openai_chat_and_returns_compacted_win
     assert resp.status == 200
     payload = await resp.json()
     assert payload["status"] == "completed"
-    assert payload["model"] == "real-openai"
+    assert payload["model"] == "claude-sonnet-4.6"
     assert payload["output"][0]["content"][0]["text"] == "Task: keep implementing compact support."
     assert payload["usage"] == {"input_tokens": 9, "output_tokens": 2, "total_tokens": 11}
-    assert captured["body"]["model"] == "real-openai"
+    assert captured["body"]["model"] == "claude-sonnet-4.6"
     assert captured["body"]["stream"] is False
     assert "service_tier" not in captured["body"]
     assert "Compact the conversation" in captured["body"]["messages"][0]["content"]

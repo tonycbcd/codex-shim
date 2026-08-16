@@ -88,3 +88,44 @@ console.log(JSON.stringify(parseToolCalls('{"arguments":{"cmd":"git status"}}', 
 
     parsed = json.loads(completed.stdout)
     assert parsed["toolCalls"][0]["function"]["name"] == "exec_command"
+
+
+def test_vendor_parser_recovers_tool_call_missing_opening_angle_bracket():
+    script = """
+import { parseToolCalls } from './vendor/deepseek-web-api/dist/deepseek/toolCalls.js';
+const definitions = [{
+  type: 'function',
+  name: 'exec_command',
+  parameters: {
+    type: 'object',
+    properties: {
+      cmd: { type: 'string' },
+      workdir: { type: 'string' }
+    },
+    required: ['cmd']
+  }
+}];
+const parsed = parseToolCalls(
+  'tool_call>\\n{"arguments":{"cmd":"pwd","workdir":"/tmp"},"name":"exec_command"}\\n</tool_call>',
+  'test',
+  definitions
+);
+console.log(JSON.stringify(parsed));
+"""
+    completed = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    parsed = json.loads(completed.stdout)
+    assert parsed["content"] == ""
+    assert len(parsed["toolCalls"]) == 1
+    call = parsed["toolCalls"][0]["function"]
+    assert call["name"] == "exec_command"
+    assert json.loads(call["arguments"]) == {
+        "cmd": "pwd",
+        "workdir": "/tmp",
+    }

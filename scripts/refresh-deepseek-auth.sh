@@ -72,13 +72,4 @@ out.chmod(0o600)
 print(f"Refreshed: token={len(token)}B, cookies={len(cookies)}")
 PY
 
-log "Auth refreshed, restarting deepseek-web-api adapter..."
-s6-svc -r /run/service/svc-deepseek-web-api 2>/dev/null || true
-sleep 2
-
-# Verify
-if curl -fsS --max-time 10 http://127.0.0.1:8766/health >/dev/null 2>&1; then
-    log "DeepSeek Web adapter healthy"
-else
-    log "WARNING: DeepSeek Web adapter health check failed"
-fi
+log "Auth refreshed. The DeepSeek adapter will start on demand."
