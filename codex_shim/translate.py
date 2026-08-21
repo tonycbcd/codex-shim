@@ -893,7 +893,13 @@ def _native_tool_description(tool: dict[str, Any]) -> str:
     if tool_type.startswith("computer_use"):
         return "Request a Codex computer-use action."
     if tool_type == "apply_patch":
-        return "Apply a unified diff patch to the working tree."
+        return (
+            "Apply a Codex patch to the working tree. Use exactly: "
+            "*** Begin Patch, then *** Update File: path / *** Add File: path / "
+            "*** Delete File: path, @@ hunks with -/+ lines, and *** End Patch. "
+            "Never use *** Hunk, *** Find, *** Replace, bare/numbered Update hunk headers, "
+            "or plain ---/+++ unified diff headers."
+        )
     if tool_type in {"local_shell", "shell"}:
         return "Run a local shell command through Codex."
     if tool_type.startswith("mcp"):
@@ -927,7 +933,16 @@ def _native_tool_parameters(tool: dict[str, Any]) -> dict[str, Any]:
     if tool_type == "apply_patch":
         return {
             "type": "object",
-            "properties": {"patch": {"type": "string", "description": "Unified diff patch"}},
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": (
+                        "Codex apply_patch grammar beginning with *** Begin Patch "
+                        "and ending with *** End Patch; use *** Update File: path "
+                        "and @@ hunks. Do not use Hunk/Find/Replace markers."
+                    ),
+                }
+            },
             "required": ["patch"],
             "additionalProperties": True,
         }

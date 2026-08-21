@@ -1,0 +1,14 @@
+diff --git a/vendor/deepseek-web-api/dist/deepseek/toolCalls.js b/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
+--- a/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
++++ b/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
+@@ -114,7 +114,9 @@ function callPayload(value, attributeName = "", toolDefinitions = []) {
+         (typeof value.name === "string" ? value.name.trim() : "") ||
+         attributeName.trim();
+     name = resolvedToolName(name, toolDefinitions);
+-    let argumentsValue = argumentObject(nested.arguments);
++    let argumentsValue = Object.prototype.hasOwnProperty.call(nested, "arguments")
++        ? argumentObject(nested.arguments)
++        : null;
+     if (!argumentsValue) {
+         const rest = Object.fromEntries(Object.entries(nested).filter(([key]) => key !== "name" && key !== "function"));
+         argumentsValue = Object.keys(rest).length > 0 ? argumentObject(rest) : null;

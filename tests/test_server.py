@@ -3,18 +3,28 @@ from __future__ import annotations
 import json
 
 import pytest
-from aiohttp import web
+from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from codex_shim import server as server_module
 from codex_shim.server import (
+    CLAUDE_EXECUTION_RULES,
+    CLAUDE_LOOP_BREAK_TOOL_THRESHOLD,
+    DEEPSEEK_EXECUTION_RULES,
     PICKER_TOKEN_HEADER,
     ResponsesStreamState,
     ShimServer,
+    _add_claude_execution_guidance,
     _check_and_strip_platform_prefix,
+    _claude_current_turn_failed_patch_count,
+    _claude_current_turn_tool_call_count,
     _custom_tool_input,
     _current_managed_model,
+    _deepseek_codegraph_project_hint,
+    _deepseek_stream_failure,
+    _normalize_apply_patch_input,
     _picker_html,
+    _prime_loopback_platform,
     _rewrite_response_model,
     _sanitize_deepseek_body,
     _sanitize_chatgpt_passthrough_body,
@@ -69,6 +79,65 @@ def test_sanitize_chatgpt_passthrough_body_drops_shim_reasoning():
     assert len(body["input"]) == 3
 
 
+def test_prime_routing_identity_rejects_non_loopback_peer():
+    class Transport:
+        @staticmethod
+        def get_extra_info(name):
+            assert name == "peername"
+            return ("203.0.113.20", 12345)
+
+    class Request:
+        headers = {"Authorization": "Bearer local-codex-shim-chatgpt"}
+        transport = Transport()
+
+    with pytest.raises(web.HTTPForbidden) as exc:
+        _prime_loopback_platform(Request())
+    assert "loopback-only" in exc.value.text
+
+
+def test_deepseek_stream_failure_detects_empty_upstream_error_before_sse_commit():
+    line = json.dumps(
+        {
+            "error": {
+                "message": (
+                    "DeepSeek Web returned an empty response after browser recovery "
+                    "and two automatic retries"
+                )
+            }
+        }
+    )
+
+    assert _deepseek_stream_failure(line) == (
+        "DeepSeek Web returned an empty response after browser recovery "
+        "and two automatic retries"
+    )
+    assert _deepseek_stream_failure("[DONE]") == "DeepSeek Web returned no stream events"
+    assert _deepseek_stream_failure(
+        json.dumps({"choices": [{"delta": {"content": "正常回答"}}]})
+    ) is None
+
+
+def test_deepseek_stream_failure_detects_legacy_empty_retry_message():
+    line = json.dumps(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "content": (
+                            "DeepSeek Web did not produce a usable tool call or final "
+                            "answer after two automatic retries. Please retry this turn."
+                        )
+                    }
+                }
+            ]
+        }
+    )
+
+    assert _deepseek_stream_failure(line) == (
+        "DeepSeek Web returned an empty response after automatic retries"
+    )
+
+
 def test_sanitize_chatgpt_passthrough_body_removes_nested_shim_encrypted_content():
     body = {
         "model": "claude-local",
@@ -115,6 +184,48 @@ def test_sanitize_chatgpt_passthrough_body_keeps_old_reasoning_content_empty():
     assert sanitized["input"][-1]["summary"] == [
         {"type": "summary_text", "text": "thought 7"}
     ]
+
+
+def test_claude_execution_guidance_counts_only_latest_user_turn_tools():
+    body = {
+        "input": [
+            {"type": "message", "role": "user", "content": "old task"},
+            {"type": "function_call", "name": "exec_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "old", "output": "ok"},
+            {"type": "message", "role": "user", "content": "new task"},
+            {"type": "function_call", "name": "exec_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "new", "output": "ok"},
+            {"type": "custom_tool_call", "name": "apply_patch", "input": "*** Begin Patch"},
+        ]
+    }
+
+    assert _claude_current_turn_tool_call_count(body) == 2
+
+
+def test_claude_execution_guidance_adds_loop_breaker_after_threshold():
+    body = {
+        "input": [
+            {"type": "message", "role": "user", "content": "fix it"},
+            *[
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": f"sed -n '{index}p' file.php"}),
+                }
+                for index in range(CLAUDE_LOOP_BREAK_TOOL_THRESHOLD)
+            ],
+        ]
+    }
+    chat_body = {"messages": [{"role": "user", "content": "fix it"}]}
+
+    count = _add_claude_execution_guidance(chat_body, body)
+
+    assert count == CLAUDE_LOOP_BREAK_TOOL_THRESHOLD
+    guidance = chat_body["messages"][0]
+    assert guidance["role"] == "system"
+    assert CLAUDE_EXECUTION_RULES in guidance["content"]
+    assert "Claude tool-loop breaker" in guidance["content"]
+    assert f"used {CLAUDE_LOOP_BREAK_TOOL_THRESHOLD} tool calls" in guidance["content"]
 
 
 async def test_claude_fallback_uses_configured_kiro_gateway(monkeypatch):
@@ -181,7 +292,7 @@ def test_platform_prefix_uses_newest_prefixed_user_message():
     assert stripped["input"][2]["content"][0]["text"] == "newest"
 
 
-def test_old_chatgpt_prefix_does_not_override_unprefixed_latest_turn():
+def test_latest_prefix_in_history_applies_to_unprefixed_followup():
     body = {
         "input": [
             {"role": "user", "content": [{"type": "input_text", "text": "[chatgpt] old"}]},
@@ -192,16 +303,52 @@ def test_old_chatgpt_prefix_does_not_override_unprefixed_latest_turn():
 
     stripped, platform = _check_and_strip_platform_prefix(body)
 
-    assert platform is None
-    assert stripped == body
+    assert platform == "chatgpt"
+    assert stripped["input"][0]["content"][0]["text"] == "old"
+    assert stripped["input"][2]["content"][0]["text"] == "latest"
+
+
+@pytest.mark.parametrize("prefix", ["claude", "claud", "kiro"])
+def test_claude_prefix_aliases_switch_back_to_claude(prefix):
+    body = {
+        "input": [
+            {"role": "user", "content": "[chatgpt] old task"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": f"[{prefix}] use Claude now"},
+            {"role": "user", "content": "synthetic follow-up"},
+        ]
+    }
+
+    stripped, platform = _check_and_strip_platform_prefix(body)
+
+    assert platform == "claude"
+    assert stripped["input"][2]["content"] == "use Claude now"
+    assert stripped["input"][0]["content"] == "[chatgpt] old task"
+
+
+def test_new_prefix_updates_remembered_session_platform():
+    shim = ShimServer()
+
+    class Request:
+        headers = {"session_id": "session-switch-model"}
+
+    assert shim._resolve_session_platform(Request(), "chatgpt") == "chatgpt"
+    assert shim._resolve_session_platform(Request(), "deepseek-pro") == "deepseek-pro"
+    assert shim._resolve_session_platform(Request(), None) == "deepseek-pro"
 
 
 def test_deepseek_context_keeps_current_task_and_compacts_optional_tools():
     body = {
         "input": [
-            {"role": "user", "content": "old task"},
+            {"role": "user", "content": "stale task"},
             {"type": "reasoning", "encrypted_content": "old", "summary": []},
             {"type": "function_call_output", "call_id": "old", "output": "x" * 10_000},
+            {"role": "user", "content": "previous task"},
+            {
+                "type": "function_call_output",
+                "call_id": "previous",
+                "output": "previous result",
+            },
             {"role": "user", "content": "fix the Python code"},
             {"type": "function_call", "call_id": "new", "name": "exec_command", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "new", "output": "result"},
@@ -215,16 +362,38 @@ def test_deepseek_context_keeps_current_task_and_compacts_optional_tools():
 
     sanitized = _sanitize_deepseek_body(body)
 
-    assert len(sanitized["input"]) == 4
-    assert sanitized["input"][0]["content"] == "old task"
+    assert len(sanitized["input"]) == 6
+    assert sanitized["input"][0]["content"] == "stale task"
     assert all(item.get("call_id") != "old" for item in sanitized["input"])
+    assert any(item.get("call_id") == "previous" for item in sanitized["input"])
     assert "Do not end while an update_plan item is still in_progress" in sanitized["instructions"]
     assert all(item.get("type") != "reasoning" for item in sanitized["input"])
     assert [tool["name"] for tool in sanitized["tools"]] == [
         "exec_command",
         "mcp__codegraph__",
     ]
+    assert sanitized["tools"][1]["tools"][0]["name"] == "codegraph_explore"
     assert len(sanitized["tools"][0]["description"]) <= 241
+
+
+def test_deepseek_execution_rules_require_real_edits_and_verification():
+    sanitized = _sanitize_deepseek_body(
+        {
+            "instructions": "Follow the repository instructions.",
+            "input": [{"role": "user", "content": "fix the code"}],
+            "tools": [],
+        }
+    )
+
+    instructions = sanitized["instructions"]
+    assert instructions.startswith("Follow the repository instructions.")
+    assert DEEPSEEK_EXECUTION_RULES in instructions
+    assert "Run dependent steps sequentially" in instructions
+    assert "successful file write" in instructions
+    assert "a real diff showing the intended change" in instructions
+    assert "Never fabricate file contents, diffs, command output" in instructions
+    assert "If no file was changed" in instructions
+    assert "distinguish pre-existing changes from this task" in instructions
 
 
 def test_deepseek_context_keeps_previous_task_for_continue_message():
@@ -241,7 +410,139 @@ def test_deepseek_context_keeps_previous_task_for_continue_message():
     sanitized = _sanitize_deepseek_body(body)
 
     assert sanitized["input"][0]["content"] == "repair the routing bug"
+    assert any(item.get("call_id") == "call_1" for item in sanitized["input"])
     assert sanitized["input"][-1]["content"] == "继续修复"
+
+
+def test_deepseek_hydrates_codegraph_namespace_with_project_hint(tmp_path):
+    project = tmp_path / "de4-web"
+    (project / ".codegraph").mkdir(parents=True)
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    f"<environment_context><cwd>{tmp_path}</cwd></environment_context>\n"
+                    "在de4-web 中结合 codegraph 修复问题"
+                ),
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                },
+            },
+            {"type": "namespace", "name": "mcp__codegraph__", "description": "code"},
+        ],
+    }
+
+    assert _deepseek_codegraph_project_hint(body) == str(project)
+    sanitized = _sanitize_deepseek_body(body)
+    tools = {
+        tool["name"]: tool
+        for tool in sanitized["tools"]
+        if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+    }
+
+    assert "mcp__codegraph__" in tools
+    codegraph = tools["mcp__codegraph__"]["tools"][0]
+    assert codegraph["parameters"]["required"] == ["query", "projectPath"]
+    assert codegraph["parameters"]["properties"]["projectPath"]["default"] == str(project)
+    assert str(project) in codegraph["description"]
+
+
+def test_deepseek_rewrites_virtual_codegraph_call_to_exec_command():
+    delta = {
+        "tool_calls": [
+            {
+                "function": {
+                    "name": "codegraph_explore",
+                    "arguments": json.dumps(
+                        {
+                            "query": "deletePhotos verified status",
+                            "projectPath": "/workspace/de4-web",
+                            "maxFiles": 12,
+                        }
+                    ),
+                }
+            }
+        ]
+    }
+    schemas = {
+        "exec_command": {
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string"},
+                "workdir": {"type": "string"},
+            },
+            "required": ["cmd"],
+            "additionalProperties": False,
+        }
+    }
+
+    ShimServer._sanitize_deepseek_delta_tool_calls(
+        delta,
+        schemas,
+        "/fallback/project",
+    )
+
+    function = delta["tool_calls"][0]["function"]
+    assert function["name"] == "exec_command"
+    assert json.loads(function["arguments"]) == {
+        "cmd": "codegraph explore 'deletePhotos verified status'",
+        "workdir": "/workspace/de4-web",
+    }
+
+
+def test_deepseek_context_keeps_previous_turn_tool_chain_only():
+    body = {
+        "input": [
+            {"role": "user", "content": "old task"},
+            {
+                "type": "function_call",
+                "call_id": "old_call",
+                "name": "exec_command",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "old_call",
+                "output": "old result",
+            },
+            {"role": "assistant", "content": "old task done"},
+            {"role": "user", "content": "inspect the current bug"},
+            {
+                "type": "function_call",
+                "call_id": "recent_call",
+                "name": "exec_command",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "recent_call",
+                "output": "recent result",
+            },
+            {"role": "assistant", "content": "the bug is in server.py"},
+            {"role": "user", "content": "fix it"},
+        ],
+        "tools": [],
+    }
+
+    sanitized = _sanitize_deepseek_body(body)
+    call_ids = {
+        item.get("call_id")
+        for item in sanitized["input"]
+        if item.get("call_id")
+    }
+
+    assert "old_call" not in call_ids
+    assert "recent_call" in call_ids
+    assert sanitized["input"][-1]["content"] == "fix it"
 
 
 def test_deepseek_context_walks_past_consecutive_continue_messages():
@@ -281,14 +582,18 @@ def test_deepseek_context_keeps_recent_dialogue_for_followup_question():
 
     assert [item.get("role") for item in sanitized["input"]] == [
         "user",
+        None,
+        None,
         "assistant",
         "user",
     ]
     assert sanitized["input"][0]["content"].startswith("Here is the OpenSearch DSL")
-    assert sanitized["input"][1]["content"] == (
+    assert sanitized["input"][1]["call_id"] == "old"
+    assert sanitized["input"][2]["call_id"] == "old"
+    assert sanitized["input"][3]["content"] == (
         "Use a lowercase normalizer on Username.keyword."
     )
-    assert sanitized["input"][2]["content"] == "我测试了，还是不行"
+    assert sanitized["input"][4]["content"] == "我测试了，还是不行"
 
 
 def test_deepseek_context_keeps_at_most_six_recent_user_turns():
@@ -328,6 +633,249 @@ def test_custom_tool_input_unwraps_freeform_envelope():
     )
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            """*** Begin Patch
+*** Update File: /tmp/example.php
+*** Hunk: public count
+-old line
++new line
+*** End Patch""",
+            """*** Begin Patch
+*** Update File: /tmp/example.php
+@@
+-old line
++new line
+*** End Patch""",
+        ),
+        (
+            """*** Begin Patch
+*** Update File: /tmp/example.php
+*** Find:
+old line
+*** Replace:
+new line
+*** End Patch""",
+            """*** Begin Patch
+*** Update File: /tmp/example.php
+@@
+-old line
++new line
+*** End Patch""",
+        ),
+        (
+            """*** Begin Patch
+*** Update File: /tmp/example.php
+*** Update 1
+old line
+---
+new line
+*** End Patch""",
+            """*** Begin Patch
+*** Update File: /tmp/example.php
+@@
+-old line
++new line
+*** End Patch""",
+        ),
+        (
+            """*** Begin Patch
+*** Update File: /tmp/example.php
+@@ -1721,6 +1721,17 @@
+ old line
++new line
+*** End Patch""",
+            """*** Begin Patch
+*** Update File: /tmp/example.php
+@@
+ old line
++new line
+*** End Patch""",
+        ),
+    ],
+)
+def test_normalize_apply_patch_input_recovers_claude_patch_dialects(raw, expected):
+    assert _normalize_apply_patch_input(json.dumps({"patch": raw})) == expected
+
+
+def test_claude_failed_patch_count_is_scoped_to_latest_user_task():
+    body = {
+        "input": [
+            {"role": "user", "content": "old task"},
+            {
+                "type": "custom_tool_call_output",
+                "output": "apply_patch verification failed",
+            },
+            {"role": "user", "content": "current task"},
+            {
+                "type": "custom_tool_call_output",
+                "output": "apply_patch verification failed: invalid hunk",
+            },
+            {
+                "type": "function_call_output",
+                "output": "failed to find expected lines",
+            },
+        ]
+    }
+
+    assert _claude_current_turn_failed_patch_count(body) == 2
+
+
+def test_claude_guidance_switches_away_from_repeated_invalid_patch():
+    responses_body = {
+        "input": [
+            {"role": "user", "content": "fix it"},
+            {
+                "type": "custom_tool_call_output",
+                "output": "apply_patch verification failed",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "output": "apply_patch verification failed",
+            },
+        ]
+    }
+    chat_body = {
+        "messages": [{"role": "user", "content": "fix it"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "apply_patch", "parameters": {}},
+            },
+            {
+                "type": "function",
+                "function": {"name": "exec_command", "parameters": {}},
+            },
+        ],
+    }
+
+    _add_claude_execution_guidance(chat_body, responses_body)
+
+    guidance = chat_body["messages"][0]["content"]
+    assert "Never emit `*** Hunk`" in guidance
+    assert "stop using apply_patch for this turn" in guidance
+    assert [tool["function"]["name"] for tool in chat_body["tools"]] == [
+        "exec_command"
+    ]
+
+
+async def test_claude_placeholder_is_suppressed_and_patch_is_normalized(
+    monkeypatch,
+    tmp_path,
+):
+    raw_patch = """*** Begin Patch
+*** Update 1: /tmp/example.php
+*** Find
+old line
+*** Replace
+new line
+*** End Patch"""
+
+    async def gateway(request):
+        response = web.StreamResponse(
+            status=200,
+            headers={"Content-Type": "text/event-stream"},
+        )
+        await response.prepare(request)
+        chunks = [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "role": "assistant",
+                            "content": "(empty placeholder)",
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_patch",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "apply_patch",
+                                        "arguments": json.dumps({"patch": raw_patch}),
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {"delta": {}, "finish_reason": "tool_calls"}
+                ]
+            },
+        ]
+        for chunk in chunks:
+            await response.write(
+                f"data: {json.dumps(chunk)}\n\n".encode()
+            )
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", gateway)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    monkeypatch.setenv(
+        "CLAUDE_GATEWAY_URL",
+        str(upstream_client.make_url("/v1/chat/completions")),
+    )
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim = ShimServer(settings)
+
+    async def proxy(request):
+        return await shim._claude_gateway_fallback(
+            request,
+            {
+                "model": "claude-sonnet-4.6",
+                "input": "fix it",
+                "tools": [{"type": "apply_patch"}],
+                "stream": True,
+            },
+        )
+
+    app = web.Application()
+    app.router.add_post("/test", proxy)
+    app.on_cleanup.append(shim._cleanup)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+
+    response = await client.post("/test")
+    assert response.status == 200
+    events = _sse_events(await response.text())
+    serialized = json.dumps(events, ensure_ascii=False)
+    assert "(empty placeholder)" not in serialized
+    done = [
+        event
+        for event in events
+        if event.get("type") == "response.custom_tool_call_input.done"
+    ][-1]
+    assert done["input"] == """*** Begin Patch
+*** Update File: /tmp/example.php
+@@
+-old line
++new line
+*** End Patch"""
+
+    await client.close()
+    await upstream_client.close()
+
+
 async def test_responses_first_platform_deepseek_pro_selects_pro(monkeypatch, tmp_path):
     captured = {}
 
@@ -354,6 +902,109 @@ async def test_responses_first_platform_deepseek_pro_selects_pro(monkeypatch, tm
     assert resp.status == 200
     assert captured["body"]["model"] == "deepseek-v4-pro"
     assert captured["path"] == "/v1/responses"
+    await shim_client.close()
+
+
+async def test_deepseek_running_uses_codeproxy_responses_endpoint(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    async def responses(request):
+        captured["body"] = await request.json()
+        return web.json_response(
+            {
+                "id": "resp_deepseek",
+                "object": "response",
+                "status": "completed",
+                "model": "deepseek",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", responses)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    monkeypatch.setattr(
+        server_module,
+        "DEEPSEEK_API_BASE",
+        str(upstream_client.make_url("")).rstrip("/"),
+    )
+    monkeypatch.setattr(server_module, "_get_deepseek_api_key", lambda: "secret")
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim = ShimServer(settings)
+
+    async def proxy(request):
+        async with ClientSession() as session:
+            return await shim._deepseek_passthrough_running(
+                request,
+                {
+                    "model": "deepseek",
+                    "stream": False,
+                    "input": [{"role": "user", "content": "fix it"}],
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "mcp__codegraph__",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "codegraph_explore",
+                                    "parameters": {"type": "object"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+                session,
+            )
+
+    app = web.Application()
+    app.router.add_post("/test", proxy)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+
+    response = await client.post("/test")
+    assert response.status == 200
+    assert (await response.json())["id"] == "resp_deepseek"
+    assert captured["body"]["model"] == server_module.DEEPSEEK_MODEL_STANDARD
+    assert captured["body"]["stream"] is False
+    assert captured["body"]["tools"][0]["type"] == "namespace"
+
+    await client.close()
+    await upstream_client.close()
+
+
+async def test_explicit_deepseek_pro_never_falls_back_to_claude_when_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    async def claude(*args, **kwargs):
+        pytest.fail("explicit DeepSeek Pro request must never route to Claude")
+
+    monkeypatch.setattr(server_module, "_deepseek_available", lambda: False)
+    monkeypatch.setattr(ShimServer, "_claude_gateway_fallback", claude)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "input": "[deepseek-pro] continue fixing",
+            "stream": True,
+        },
+    )
+
+    assert resp.status == 503
+    assert "will not switch models" in await resp.text()
     await shim_client.close()
 
 
@@ -391,10 +1042,21 @@ async def test_responses_defaults_to_claude_even_for_chatgpt_model(
 
 
 @pytest.mark.parametrize(
-    "request_body",
+    ("request_body", "headers"),
     [
-        {"model": "gpt-5.4", "input": "hi", "first_platform": "chatgpt"},
-        {"model": "gpt-5.4", "input": "[chatgpt] hi"},
+        (
+            {"model": "gpt-5.4", "input": "hi", "first_platform": "chatgpt"},
+            None,
+        ),
+        ({"model": "gpt-5.4", "input": "[chatgpt] hi"}, None),
+        (
+            {"model": "gpt-5.4", "input": "hi"},
+            {"x-codex-shim-platform": "chatgpt"},
+        ),
+        (
+            {"model": "gpt-5.4", "input": "hi"},
+            {"Authorization": "Bearer local-codex-shim-chatgpt"},
+        ),
     ],
 )
 async def test_responses_only_explicit_chatgpt_routes_to_chatgpt(
@@ -402,6 +1064,7 @@ async def test_responses_only_explicit_chatgpt_routes_to_chatgpt(
     tmp_path,
     auth_present,
     request_body,
+    headers,
 ):
     captured = {}
 
@@ -419,7 +1082,11 @@ async def test_responses_only_explicit_chatgpt_routes_to_chatgpt(
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
 
-    resp = await shim_client.post("/v1/responses", json=request_body)
+    resp = await shim_client.post(
+        "/v1/responses",
+        json=request_body,
+        headers=headers,
+    )
 
     assert resp.status == 200
     assert await resp.json() == {"platform": "chatgpt"}
@@ -901,8 +1568,8 @@ async def test_responses_compact_chatgpt_passthrough_uses_compact_endpoint(monke
     resp = await shim_client.post("/v1/responses/compact", json={"model": "openai-gpt-5-5-codex-max", "input": "hi", "stream": True, "first_platform": "ChatGPT"})
     assert resp.status == 200
     payload = await resp.json()
-    assert payload["model"] == "openai-gpt-5-5-codex-max"
-    assert payload["output"][0]["model"] == "openai-gpt-5-5-codex-max"
+    assert payload["model"] == "gpt-5.6-sol"
+    assert payload["output"][0]["model"] == "gpt-5.6-sol"
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
     assert captured["body"]["model"] == "gpt-5.6-sol"
     assert "stream" not in captured["body"]

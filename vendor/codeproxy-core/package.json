@@ -1,0 +1,67 @@
+{
+  "name": "@codeproxy/core",
+  "version": "0.1.25",
+  "description": "Convert upstream LLM APIs (Chat Completions / Anthropic Messages) to OpenAI Responses API format. Zero dependencies, works in browser/Node/edge.",
+  "keywords": [
+    "openai",
+    "responses-api",
+    "anthropic",
+    "claude",
+    "deepseek",
+    "translate",
+    "typescript"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "lint:fix": "eslint \"src/**/*.ts\" \"tests/**/*.ts\" --fix",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@ai0x0/utils": "^0.0.31",
+    "@eslint/js": "^9.39.4",
+    "@rollup/rollup-darwin-arm64": "^4.60.3",
+    "@types/node": "^22.19.17",
+    "@vitest/coverage-istanbul": "^2.1.9",
+    "@vitest/coverage-v8": "^2.1.9",
+    "eslint": "^9.39.4",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.5",
+    "husky": "^9.1.7",
+    "prettier": "^3.8.3",
+    "rollup": "^3.30.0",
+    "tsup": "^8.3.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.59.2",
+    "vitest": "^2.1.0"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/codeproxy-ai/core.git"
+  }
+}

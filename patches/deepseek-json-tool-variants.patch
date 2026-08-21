@@ -1,0 +1,126 @@
+diff --git a/vendor/deepseek-web-api/dist/deepseek/toolCalls.js b/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
+--- a/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
++++ b/vendor/deepseek-web-api/dist/deepseek/toolCalls.js
+@@ -5,6 +5,7 @@ const TOOL_TAG = /<\s*(\/?)\s*(tool[_-]?call|_?call)\b([^>]*)>/gi;
+ const TOOL_WRAPPER_TAG = /<\s*\/?\s*(?:tool[_-]?calls|_?calls)\b[^>]*>/gi;
+ const DIRECT_TOOL_BLOCK = /<\s*([A-Za-z_][\w:.-]*)\b([^>]*)>([\s\S]*?)<\s*\/\s*\1\s*>/gi;
+ const PARAMETER_BLOCK = /<\s*parameter\b([^>]*)>([\s\S]*?)<\s*\/\s*parameter\s*>/gi;
++const JSON_FENCE = /```(?:json)?\s*([\s\S]*?)```/gi;
+ function stableValue(value) {
+     if (Array.isArray(value))
+         return value.map(stableValue);
+@@ -110,12 +110,20 @@ function callPayload(value, attributeName = "", toolDefinitions = []) {
+     if (namedPayload)
+         return namedPayload;
+     const nested = isRecord(value.function) ? value.function : value;
+-    let name = (typeof nested.name === "string" ? nested.name.trim() : "") ||
++    const explicitName = (typeof nested.name === "string" ? nested.name.trim() : "") ||
+         (typeof value.name === "string" ? value.name.trim() : "") ||
+         attributeName.trim();
++    const embeddedName = !explicitName &&
++        isRecord(nested.arguments) &&
++        typeof nested.arguments.name === "string"
++        ? nested.arguments.name.trim()
++        : "";
++    let name = explicitName || embeddedName;
+     name = resolvedToolName(name, toolDefinitions);
+     let argumentsValue = Object.prototype.hasOwnProperty.call(nested, "arguments")
+         ? argumentObject(nested.arguments)
+         : null;
++    if (embeddedName && isRecord(argumentsValue)) {
++        argumentsValue = Object.fromEntries(Object.entries(argumentsValue).filter(([key]) => key !== "name"));
++    }
+     if (!argumentsValue) {
+         const rest = Object.fromEntries(Object.entries(nested).filter(([key]) => key !== "name" && key !== "function"));
+         argumentsValue = Object.keys(rest).length > 0 ? argumentObject(rest) : null;
+@@ -126,6 +134,15 @@ function callPayload(value, attributeName = "", toolDefinitions = []) {
+         const rest = Object.fromEntries(Object.entries(nested).filter(([key]) => key !== "name" && key !== "function"));
+         argumentsValue = Object.keys(rest).length > 0 ? argumentObject(rest) : null;
+     }
++    if (name === "codegraph_explore" &&
++        isRecord(argumentsValue) &&
++        typeof argumentsValue.query !== "string" &&
++        typeof argumentsValue.input === "string") {
++        argumentsValue = {
++            ...argumentsValue,
++            query: argumentsValue.input,
++        };
++        delete argumentsValue.input;
++    }
+     if (!name && argumentsValue)
+         name = inferredToolName(argumentsValue, toolDefinitions);
+     return name && argumentsValue ? { name, arguments: argumentsValue } : null;
+@@ -397,7 +405,10 @@ function withoutToolTags(text) {
+     return text.replace(TOOL_TAG, "");
+ }
+ function protocolOnly(text, ranges) {
+-    return withoutToolTags(removeRanges(text, ranges)).trim().length === 0;
++    return withoutToolTags(removeRanges(text, ranges))
++        .replace(/```(?:json)?/gi, "")
++        .replace(/[\[\],;]/g, "")
++        .trim().length === 0;
+ }
+ function validToolPayload(payload, toolDefinitions) {
+     const definitions = normalizedToolDefinitions(toolDefinitions);
+@@ -610,14 +621,27 @@ export function parseToolCalls(text, seed = "tool", toolDefinitions = []) {
+     const configured = configuredToolCandidates(normalizedText, toolDefinitions);
+     const direct = directTaggedCandidates(normalizedText, toolDefinitions);
+     const blocked = [...blocks, ...configured.blocks, ...direct.blocks];
++    JSON_FENCE.lastIndex = 0;
++    const jsonFences = [...normalizedText.matchAll(JSON_FENCE)].map((match) => {
++        const body = match[1] ?? "";
++        const start = match.index ?? 0;
++        const bodyOffset = match[0].indexOf(body);
++        return {
++            start,
++            end: start + match[0].length,
++            bodyStart: start + bodyOffset,
++            bodyEnd: start + bodyOffset + body.length,
++        };
++    });
+     const bareObjects = collectJsonObjects(normalizedText, /^\s*\{/.test(normalizedText)).filter((object) => !overlaps({ start: object.start, end: object.end }, blocked));
+     const bareRanges = bareObjects
+         .filter((object) => looksLikeToolJson(object.raw) ||
+         (normalizedToolDefinitions(toolDefinitions).length > 0 &&
+             isRecord(object.value) &&
+             isRecord(object.value.arguments)))
+         .map((object) => ({ start: object.start, end: object.end }));
+     const bareContext = protocolOnly(normalizedText, [...blocked, ...bareRanges]);
+-    const bareCalls = bareContext
+-        ? bareObjects.flatMap((object) => {
++    const fencedBareObjects = bareObjects.filter((object) => jsonFences.some((fence) => object.start >= fence.bodyStart &&
++        object.end <= fence.bodyEnd));
++    const eligibleBareObjects = bareContext ? bareObjects : fencedBareObjects;
++    const bareCalls = eligibleBareObjects.flatMap((object) => {
+             const payload = callPayload(object.value, "", toolDefinitions);
+             return payload
+                 ? [{ order: object.start, consume: { start: object.start, end: object.end }, payload }]
+                 : [];
+-        })
+-        : [];
++        });
++    const fencedToolRanges = jsonFences.filter((fence) => bareCalls.some((candidate) => candidate.order >= fence.bodyStart &&
++        candidate.order <= fence.bodyEnd));
+     const loose = tagged.calls.length === 0 && direct.calls.length === 0
+         ? looseParameterCandidate(normalizedText, toolDefinitions)
+         : null;
+@@ -650,6 +674,7 @@ export function parseToolCalls(text, seed = "tool", toolDefinitions = []) {
+     const cleaned = withoutToolTags(removeRanges(normalizedText, [
+         ...consumed,
+         ...(toolCalls.length > 0 ? blocks : []),
++        ...(toolCalls.length > 0 ? fencedToolRanges : []),
+         ...(bareContext || isProtocolOnly ? artifactRanges : []),
+     ]))
+         .replace(/\n{3,}/g, "\n\n")
+@@ -650,7 +661,10 @@ export function parseToolCalls(text, seed = "tool", toolDefinitions = []) {
+     ]))
+         .replace(/\n{3,}/g, "\n\n")
+         .trim();
+-    return { content: cleaned, toolCalls };
++    return {
++        content: toolCalls.length > 0 && isProtocolOnly ? "" : cleaned,
++        toolCalls,
++    };
+ }
+ /** Prefer valid output calls, then promote calls leaked into reasoning. */
+ export function parseToolCallsFromParts(outputText, reasoningText, seed = "tool", toolDefinitions = []) {

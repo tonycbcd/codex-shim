@@ -28,5 +28,15 @@ dist/
 .DS_Store
 .idea/
 .vscode/
-vendor/
+# The browser automation package is installed separately and patched at
+# runtime. The protocol adapter is deliberately vendored and version-locked.
+vendor/*
+!vendor/codeproxy-core/
+!vendor/codeproxy-core/**
+!vendor/deepseek-web-api/
+vendor/deepseek-web-api/**
+!vendor/deepseek-web-api/dist/
+!vendor/deepseek-web-api/dist/api/
+!vendor/deepseek-web-api/dist/api/responses.js
+!vendor/deepseek-web-api/dist/api/codeproxyResponses.js
 data/

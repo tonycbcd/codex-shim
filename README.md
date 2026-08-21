@@ -54,6 +54,28 @@ local:
   benchmark section below explains how to measure your own setup against
   an explicit oracle before quoting numbers.
 
+### DeepSeek protocol compatibility
+
+DeepSeek uses the vendored `@codeproxy/core` Responses API adapter rather than
+maintaining a second partial translation implementation in Python:
+
+```text
+Codex Responses request
+  -> @codeproxy/core Responses -> Chat conversion
+  -> DeepSeek Web prompt/tool recovery
+  -> standard Chat Completions chunks
+  -> @codeproxy/core Chat -> Responses SSE conversion
+```
+
+This covers assistant/tool history, namespace flattening and restoration,
+upstream-safe tool-name sanitization, parallel and fragmented tool calls,
+reasoning streams, usage/cached-token accounting, and canonical Responses
+lifecycle events. Browser-only recovery for malformed XML/JSON tool text stays
+isolated in `vendor/deepseek-web-api`.
+
+The pinned upstream version and commit are recorded in
+`vendor/codeproxy-core/UPSTREAM.md`.
+
 ---
 
 ## Requirements
@@ -601,11 +623,26 @@ To explicitly try ChatGPT first, you have two options:
 The prefix is case-insensitive and automatically stripped before sending to the
 upstream API.
 
+**Option 3:** A loopback Prime/custom-provider client may identify itself with
+either of these request headers:
+
+```text
+x-codex-shim-platform: chatgpt
+Authorization: Bearer local-codex-shim-chatgpt
+```
+
+The bearer value is a local routing identity, not an upstream ChatGPT token.
+Codex-shim still reads the actual ChatGPT credential from `~/.codex/auth.json`.
+These Prime routing headers are rejected unless the direct TCP peer is a
+loopback address; keep the shim bound to loopback and do not expose it through
+an unauthenticated local reverse proxy.
+
 | Trigger | Routing behavior |
 |---------|------------------|
 | No prefix, no `first_platform` (default) | Claude gateway → OpenAI API fallback |
 | `[chatgpt]` prefix in input | ChatGPT passthrough → Claude → OpenAI API |
 | `first_platform: "ChatGPT"` | ChatGPT passthrough → Claude → OpenAI API |
+| Prime loopback routing identity/header | ChatGPT passthrough → Claude → OpenAI API |
 
 Both `first_platform` and `[chatgpt]` prefix are stripped before forwarding to upstream APIs.
 

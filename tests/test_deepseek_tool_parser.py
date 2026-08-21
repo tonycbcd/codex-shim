@@ -82,6 +82,40 @@ def test_deepseek_parser_recovers_mismatched_opening_tag_with_parameters():
     }
 
 
+def test_deepseek_parser_recovers_exec_command_closed_as_exec_calls():
+    calls = ShimServer._recover_deepseek_tool_calls(
+        """
+<exec_command>
+<cmd>grep -nEi "block|ban|blacklist" /opt/codes/ms/de4-web/common/controllers/censor/ProfileController.php</cmd>
+<justification>Inspect for any country-based blocking logic</justification>
+<login>true</login>
+<max_output_tokens>20000</max_output_tokens>
+<prefix_rule>[]</prefix_rule>
+<sandbox_permissions>use_default</sandbox_permissions>
+<shell>bash</shell>
+<tty>false</tty>
+<workdir>/opt/codes/ms-yq2anvut27d66c7yhr7lu</workdir>
+<yield_time_ms>10000</yield_time_ms>
+</exec_calls>
+"""
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "exec_command"
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "cmd": 'grep -nEi "block|ban|blacklist" /opt/codes/ms/de4-web/common/controllers/censor/ProfileController.php',
+        "justification": "Inspect for any country-based blocking logic",
+        "login": True,
+        "max_output_tokens": 20000,
+        "prefix_rule": [],
+        "sandbox_permissions": "use_default",
+        "shell": "bash",
+        "tty": False,
+        "workdir": "/opt/codes/ms-yq2anvut27d66c7yhr7lu",
+        "yield_time_ms": 10000,
+    }
+
+
 def test_deepseek_tool_arguments_drop_invalid_optional_array_values():
     schema = {
         "type": "object",
@@ -138,5 +172,6 @@ def test_shim_detects_all_known_malformed_deepseek_xml_variants():
         '<invoke name="exec_command">',
         '<parameter name="cmd">',
         "tool_call>",
+        "</exec_calls>",
     ):
         assert ShimServer._is_malformed_tool_call(text)

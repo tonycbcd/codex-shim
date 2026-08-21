@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import ipaddress
 import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import sys
 import time
@@ -69,6 +71,10 @@ DEEPSEEK_API_BASE = "http://127.0.0.1:8766"
 DEEPSEEK_API_KEY_FILE = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / ".api-key"
 DEEPSEEK_RUN_SCRIPT = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / "run.sh"
 DEEPSEEK_LOG_FILE = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / "server.log"
+DEEPSEEK_CHROME_PROFILE = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / "chrome-profile"
+DEEPSEEK_CDP_FILE = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / "chrome.cdp"
+DEEPSEEK_SESSIONS_FILE = Path(__file__).resolve().parents[1] / ".deepseek-web-data" / "sessions.json"
+DEEPSEEK_MAX_SESSIONS_BYTES = 32 * 1024 * 1024
 DEEPSEEK_MODEL_STANDARD = "deepseek-v4-flash"
 DEEPSEEK_MODEL_PRO = "deepseek-v4-pro"
 DEFAULT_CLAUDE_GATEWAY_URL = "http://127.0.0.1:8901/v1/chat/completions"
@@ -76,6 +82,123 @@ DEFAULT_CLAUDE_GATEWAY_URL = "http://127.0.0.1:8901/v1/chat/completions"
 # claude-opus-4.6 returns 400 "Invalid model ID or insufficient subscription
 # level" on this account, which is why default shim->Kiro requests failed.
 DEFAULT_CLAUDE_GATEWAY_MODEL = "claude-sonnet-4.6"
+
+CLAUDE_EXECUTION_RULES = """Claude Codex execution contract:
+- For a small, localized code change, perform one focused discovery pass, then edit immediately.
+- Prefer apply_patch for source edits. Do not use line-number-based sed/Python deletion or backup-and-restore editing.
+- apply_patch accepts only Codex patch grammar: `*** Begin Patch`, then `*** Update File: path` / `*** Add File: path` / `*** Delete File: path`, bare `@@` hunks with `-` and `+` lines, and `*** End Patch`.
+- Never put unified-diff line ranges in a hunk header: use `@@`, not `@@ -1721,6 +1721,17 @@`.
+- Never emit `*** Hunk`, `*** Find`, `*** Replace`, bare/numbered `*** Update` hunk headers, or a plain `---/+++` unified diff to apply_patch.
+- Do not repeatedly read the same file ranges or restate the same plan. Reuse tool results already present in the conversation.
+- After editing, inspect the diff once and run the narrowest relevant syntax check or test.
+- If an attempted edit is wrong, inspect the current diff and correct it directly instead of restoring and restarting the investigation.
+- Do not claim that requested logic is fully removed until references to the removed symbols/text have been searched and the diff has been verified.
+- Preserve unrelated pre-existing changes and identify them separately in the final report."""
+
+CLAUDE_LOOP_BREAK_TOOL_THRESHOLD = 8
+CLAUDE_LOOP_BREAK_RULES = """Claude tool-loop breaker:
+- This turn has already used {tool_count} tool calls.
+- Stop broad exploration and do not reread ranges already inspected.
+- If the requested patch is not yet applied, make the smallest safe edit now with apply_patch.
+- If the patch is already applied, run at most one focused verification command and then give the final answer.
+- Do not announce another plan, restore from a backup, or restart the task from the beginning."""
+
+CLAUDE_PATCH_FAILURE_RULES = """Claude apply_patch recovery:
+- Previous apply_patch calls in this same task failed validation.
+- Do not repeat the same patch syntax. Use only the exact Codex patch grammar described above.
+- If two apply_patch attempts have already failed, stop using apply_patch for this turn. Use one focused exec_command edit, then inspect git diff and run the relevant syntax check."""
+
+DEEPSEEK_EXECUTION_RULES = """DeepSeek Codex execution contract:
+- Treat requests to modify, fix, implement, create, or refactor code as execution tasks, not explanation-only tasks. Keep using tools until the requested change is applied or a concrete blocker is proven.
+- Before editing, confirm the current workdir/repository, inspect git status, and verify the target file exists. Current tool output is the source of truth; never reuse a path, branch, file, or diff from an earlier workspace without checking it again.
+- Run dependent steps sequentially: locate -> inspect -> edit -> diff -> format -> test/build. Only independent read-only checks may run in parallel.
+- Prefer apply_patch or another explicit file-edit tool. Preserve pre-existing user changes and do not reset, checkout, revert, or broadly reformat unrelated files.
+- A failed critical tool call invalidates dependent assumptions. Recover from the failure before continuing, and never describe a planned or failed command as if it succeeded.
+- You may claim completion only after a successful file write, a real diff showing the intended change, git diff --check (or equivalent), and a relevant test/build/syntax verification. If a verification cannot run, state exactly what remains unverified.
+- Never fabricate file contents, diffs, command output, exit codes, test results, or deployment status. If no file was changed, explicitly say that no code was modified.
+- Do not end while an update_plan item is still in_progress or while the requested modification is unverified. A progress list, artifact list, source list, diagnosis, or proposed patch is not a completed implementation.
+- If a tool call fails because of arguments, immediately retry with only valid required arguments. Keep every integer tool argument as an integer, never as a decimal such as 20000.0.
+- Call configured tool names exactly. For CodeGraph use codegraph_explore with query and projectPath; never call an MCP namespace name directly.
+- Stay in the request's current project/workdir. Never scan / or unrelated repositories to guess the task.
+- Final reports for execution tasks must name changed files, summarize the actual diff, list verification commands and their real outcomes, and distinguish pre-existing changes from this task."""
+
+
+def _claude_current_turn_tool_call_count(body: dict[str, Any]) -> int:
+    inputs = body.get("input")
+    if not isinstance(inputs, list):
+        return 0
+
+    latest_user_index = -1
+    for index, item in enumerate(inputs):
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") == "user" and item.get("type") in {None, "message"}:
+            latest_user_index = index
+
+    return sum(
+        1
+        for item in inputs[latest_user_index + 1 :]
+        if isinstance(item, dict)
+        and item.get("type") in {"function_call", "custom_tool_call", "computer_call"}
+    )
+
+
+def _claude_current_turn_failed_patch_count(body: dict[str, Any]) -> int:
+    inputs = body.get("input")
+    if not isinstance(inputs, list):
+        return 0
+
+    latest_user_index = -1
+    for index, item in enumerate(inputs):
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") == "user" and item.get("type") in {None, "message"}:
+            latest_user_index = index
+
+    failure_pattern = re.compile(
+        r"apply_patch verification failed|invalid (?:patch|hunk)|"
+        r"failed to find expected lines|patch does not apply|corrupt patch",
+        re.IGNORECASE,
+    )
+    return sum(
+        1
+        for item in inputs[latest_user_index + 1 :]
+        if isinstance(item, dict)
+        and item.get("type") in {"function_call_output", "custom_tool_call_output"}
+        and failure_pattern.search(json.dumps(item, ensure_ascii=False))
+    )
+
+
+def _add_claude_execution_guidance(
+    chat_body: dict[str, Any],
+    responses_body: dict[str, Any],
+) -> int:
+    tool_count = _claude_current_turn_tool_call_count(responses_body)
+    failed_patch_count = _claude_current_turn_failed_patch_count(responses_body)
+    guidance = CLAUDE_EXECUTION_RULES
+    if failed_patch_count:
+        guidance += "\n\n" + CLAUDE_PATCH_FAILURE_RULES
+    if failed_patch_count >= 2:
+        tools = chat_body.get("tools")
+        if isinstance(tools, list):
+            chat_body["tools"] = [
+                tool
+                for tool in tools
+                if not (
+                    isinstance(tool, dict)
+                    and isinstance(tool.get("function"), dict)
+                    and tool["function"].get("name") == "apply_patch"
+                )
+            ]
+    if tool_count >= CLAUDE_LOOP_BREAK_TOOL_THRESHOLD:
+        guidance += "\n\n" + CLAUDE_LOOP_BREAK_RULES.format(tool_count=tool_count)
+
+    messages = chat_body.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+        chat_body["messages"] = messages
+    messages.insert(0, {"role": "system", "content": guidance})
+    return tool_count
 
 
 
@@ -189,6 +312,13 @@ class ShimServer:
         if not DEEPSEEK_RUN_SCRIPT.is_file():
             raise RuntimeError(f"DeepSeek launcher not found: {DEEPSEEK_RUN_SCRIPT}")
 
+        self._reset_oversized_deepseek_sessions()
+
+        # The managed browser outlives the on-demand Node service. A browser
+        # left running for many hours can accept its CDP websocket connection
+        # but never finish Playwright initialization. DeepSeek Web then emits
+        # an HTTP-200 empty stream, so recycle orphaned Chrome before startup.
+        await self._stop_deepseek_chrome()
         DEEPSEEK_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         self._deepseek_log_handle = DEEPSEEK_LOG_FILE.open("ab", buffering=0)
         self._deepseek_process = await asyncio.create_subprocess_exec(
@@ -213,6 +343,45 @@ class ShimServer:
         await self._stop_deepseek_service()
         raise RuntimeError("DeepSeek Web API did not become healthy within 20 seconds")
 
+    @staticmethod
+    def _reset_oversized_deepseek_sessions() -> None:
+        """Reset the local index before JSON serialization can OOM Node.
+
+        Codex resends prompt history, so losing this local lookup index only
+        makes the adapter establish a fresh DeepSeek conversation.
+        """
+        try:
+            size = DEEPSEEK_SESSIONS_FILE.stat().st_size
+        except FileNotFoundError:
+            return
+        if size <= DEEPSEEK_MAX_SESSIONS_BYTES:
+            return
+
+        temporary = DEEPSEEK_SESSIONS_FILE.with_name(
+            f"{DEEPSEEK_SESSIONS_FILE.name}.{os.getpid()}.reset"
+        )
+        try:
+            temporary.write_text(
+                '{"sessions":{},"convs":{}}\n',
+                encoding="utf-8",
+            )
+            temporary.chmod(0o600)
+            temporary.replace(DEEPSEEK_SESSIONS_FILE)
+        except OSError as exc:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise RuntimeError(
+                f"Unable to reset oversized DeepSeek session index: {exc}"
+            ) from exc
+
+        print(
+            f"[shim] Reset oversized DeepSeek session index: "
+            f"{size} bytes > {DEEPSEEK_MAX_SESSIONS_BYTES}",
+            flush=True,
+        )
+
     async def _stop_deepseek_service(self) -> None:
         process = self._deepseek_process
         self._deepseek_process = None
@@ -233,6 +402,54 @@ class ShimServer:
         if self._deepseek_log_handle is not None:
             self._deepseek_log_handle.close()
             self._deepseek_log_handle = None
+        if process is not None:
+            await self._stop_deepseek_chrome()
+
+    @staticmethod
+    def _managed_deepseek_chrome_pid() -> int | None:
+        lock_path = DEEPSEEK_CHROME_PROFILE / "SingletonLock"
+        try:
+            lock_target = os.readlink(lock_path)
+            pid = int(lock_target.rsplit("-", 1)[-1])
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+        expected_profile = f"--user-data-dir={DEEPSEEK_CHROME_PROFILE}".encode()
+        if b"chrome" not in cmdline.lower() or expected_profile not in cmdline:
+            return None
+        return pid
+
+    async def _stop_deepseek_chrome(self) -> None:
+        pid = self._managed_deepseek_chrome_pid()
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            else:
+                for _ in range(30):
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            print(f"[shim] DeepSeek managed Chrome stopped pid={pid}", flush=True)
+
+        try:
+            DEEPSEEK_CDP_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        if pid is None or not Path(f"/proc/{pid}").exists():
+            for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                try:
+                    (DEEPSEEK_CHROME_PROFILE / name).unlink()
+                except FileNotFoundError:
+                    pass
 
     async def _acquire_deepseek_service(self) -> None:
         async with self._deepseek_lock:
@@ -417,9 +634,10 @@ class ShimServer:
         # Codex client may instead send the same choice as first_platform.
         body, prefix_platform = _check_and_strip_platform_prefix(body)
         requested_platform = str(body.pop("first_platform", "") or "").strip().lower()
+        header_platform = _prime_loopback_platform(request)
         # first_platform is an explicit per-request routing decision and must
         # override prefixes retained in older conversation history.
-        explicit_platform = requested_platform or prefix_platform or None
+        explicit_platform = requested_platform or header_platform or prefix_platform or None
         platform = self._resolve_session_platform(request, explicit_platform)
         if platform:
             print(f"[shim] Platform prefix detected: [{platform}]", flush=True)
@@ -428,16 +646,28 @@ class ShimServer:
                     body["model"] = DEEPSEEK_MODEL_STANDARD
                     return await self._deepseek_passthrough(request, body, "/v1/responses")
                 else:
-                    print("[shim] ⚠️  DeepSeek not available, falling back to Claude", flush=True)
+                    raise web.HTTPServiceUnavailable(
+                        text="DeepSeek is not available; explicit [deepseek] requests will not switch models"
+                    )
             elif platform == "deepseek-pro":
                 if _deepseek_available():
                     body["model"] = DEEPSEEK_MODEL_PRO
                     return await self._deepseek_passthrough(request, body, "/v1/responses")
                 else:
-                    print("[shim] ⚠️  DeepSeek not available, falling back to Claude", flush=True)
+                    raise web.HTTPServiceUnavailable(
+                        text=(
+                            "DeepSeek Pro is not available; explicit [deepseek-pro] "
+                            "requests will not switch models"
+                        )
+                    )
             elif platform == "chatgpt":
                 if chatgpt_passthrough_available():
-                    return await self._chatgpt_passthrough(request, body)
+                    model = str(body.get("model") or CHATGPT_MODEL_SLUG)
+                    return await self._chatgpt_passthrough(
+                        request,
+                        body,
+                        upstream_model=chatgpt_upstream_model(model),
+                    )
                 else:
                     print("[shim] ⚠️  ChatGPT not available, falling back to Claude", flush=True)
             elif platform in {"claud", "claude", "kiro"}:
@@ -487,7 +717,8 @@ class ShimServer:
         body = await self._maybe_apply_auto_router(body)
         body, prefix_platform = _check_and_strip_platform_prefix(body)
         requested_platform = str(body.pop("first_platform", "") or "").strip().lower()
-        explicit_platform = requested_platform or prefix_platform or None
+        header_platform = _prime_loopback_platform(request)
+        explicit_platform = requested_platform or header_platform or prefix_platform or None
         platform = self._resolve_session_platform(request, explicit_platform)
         if platform == "chatgpt" and chatgpt_passthrough_available():
             model = str(body.get("model") or CHATGPT_MODEL_SLUG)
@@ -760,8 +991,16 @@ class ShimServer:
         if not access_token:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
-        original_client_model = str(forwarded.get("model") or "gpt-5.5")
-        forwarded["model"] = CHATGPT_MODEL_SLUG  # First try: configured model (gpt-5.6-sol)
+        requested_model = str(forwarded.get("model") or CHATGPT_MODEL_SLUG)
+        original_client_model = (
+            upstream_model
+            or (
+                chatgpt_upstream_model(requested_model)
+                if is_chatgpt_passthrough_slug(requested_model)
+                else CHATGPT_MODEL_SLUG
+            )
+        )
+        forwarded["model"] = original_client_model
         # Force reasoning effort to medium for ChatGPT passthrough
         if isinstance(forwarded.get("reasoning"), dict):
             forwarded["reasoning"]["effort"] = "medium"
@@ -789,11 +1028,12 @@ class ShimServer:
         await response.prepare(request)
         await _safe_write(response, b": codex-shim connected\n\n")
 
-        # Two-stage ChatGPT attempt: first gpt-5.6-sol, then original client model
+        # Honor an explicitly selected ChatGPT model first. The configured
+        # default remains a capacity fallback for compatible requests.
         # Fallback models will be added dynamically if "at capacity" error is detected
-        models_to_try = [CHATGPT_MODEL_SLUG]
-        if original_client_model != CHATGPT_MODEL_SLUG:
-            models_to_try.append(original_client_model)
+        models_to_try = [original_client_model]
+        if CHATGPT_MODEL_SLUG != original_client_model:
+            models_to_try.append(CHATGPT_MODEL_SLUG)
         capacity_fallbacks_added = False
 
         timed_out = False
@@ -1214,6 +1454,18 @@ class ShimServer:
             text,
         )
         normalized_text = re.sub(
+            r"<\s*exec_command\b(?P<attrs>[^>]*)>(?P<body>[\s\S]*?)<\s*/\s*exec_calls\s*>",
+            r"<exec_command\g<attrs>>\g<body></exec_command>",
+            normalized_text,
+            flags=re.IGNORECASE,
+        )
+        normalized_text = re.sub(
+            r"<\s*invoke\b(?P<attrs>[^>]*)>(?P<body>[\s\S]*?)<\s*/\s*exec_calls\s*>",
+            r"<invoke\g<attrs>>\g<body></invoke>",
+            normalized_text,
+            flags=re.IGNORECASE,
+        )
+        normalized_text = re.sub(
             r"<\s*/?\s*(?:tool[_-]?calls|_?calls)\b[^>]*>",
             "",
             normalized_text,
@@ -1408,6 +1660,7 @@ class ShimServer:
         cls,
         delta: dict[str, Any],
         schemas: dict[str, dict[str, Any]],
+        project_hint: str | None = None,
     ) -> None:
         for call in delta.get("tool_calls") or []:
             if not isinstance(call, dict):
@@ -1417,6 +1670,33 @@ class ShimServer:
                 continue
             name = function.get("name")
             arguments = function.get("arguments")
+            if (
+                isinstance(name, str)
+                and name in {"codegraph_explore", "mcp__codegraph", "mcp__codegraph__"}
+                and name not in schemas
+                and isinstance(arguments, str)
+            ):
+                try:
+                    codegraph_arguments = json.loads(arguments)
+                except (TypeError, ValueError):
+                    codegraph_arguments = None
+                if isinstance(codegraph_arguments, dict):
+                    query = codegraph_arguments.get("query") or codegraph_arguments.get("input")
+                    if isinstance(query, str) and query.strip():
+                        workdir = codegraph_arguments.get("projectPath") or project_hint
+                        exec_arguments: dict[str, Any] = {
+                            "cmd": f"codegraph explore {shlex.quote(query.strip())}",
+                        }
+                        if isinstance(workdir, str) and workdir.strip():
+                            exec_arguments["workdir"] = workdir.strip()
+                        function["name"] = "exec_command"
+                        function["arguments"] = json.dumps(
+                            exec_arguments,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        name = "exec_command"
+                        arguments = function["arguments"]
             schema = schemas.get(name) if isinstance(name, str) else None
             if not schema or not isinstance(arguments, str):
                 continue
@@ -1440,29 +1720,21 @@ class ShimServer:
         """Run the heavy DeepSeek compatibility service only for this request."""
         api_key = _get_deepseek_api_key()
         if not api_key:
-            print("[shim] ⚠️  DeepSeek API key not found, falling back to Claude", flush=True)
-            return await self._claude_gateway_fallback(
-                request,
-                body,
-                response_model_override="deepseek",
-            ) or await self._openai_api_fallback(
-                request,
-                body,
-                response_model_override="deepseek",
+            raise web.HTTPServiceUnavailable(
+                text=(
+                    "DeepSeek API key not found; explicit DeepSeek requests "
+                    "will not switch models"
+                )
             )
 
         try:
             await self._acquire_deepseek_service()
         except Exception as exc:
-            print(f"[shim] ⚠️  DeepSeek startup failed: {exc}, falling back to Claude", flush=True)
-            return await self._claude_gateway_fallback(
-                request,
-                body,
-                response_model_override="deepseek",
-            ) or await self._openai_api_fallback(
-                request,
-                body,
-                response_model_override="deepseek",
+            raise web.HTTPServiceUnavailable(
+                text=(
+                    f"DeepSeek startup failed: {exc}; explicit DeepSeek requests "
+                    "will not switch models"
+                )
             )
 
         session = ClientSession(timeout=self.timeout)
@@ -1493,9 +1765,24 @@ class ShimServer:
         """
         api_key = _get_deepseek_api_key()
         if not api_key:
-            print("[shim] ⚠️  DeepSeek API key not found, falling back to Claude", flush=True)
-            return await self._claude_gateway_fallback(request, body, response_model_override="deepseek") or \
-                   await self._openai_api_fallback(request, body, response_model_override="deepseek")
+            raise web.HTTPServiceUnavailable(
+                text=(
+                    "DeepSeek API key not found; explicit DeepSeek requests "
+                    "will not switch models"
+                )
+            )
+
+        # DeepSeek protocol conversion is centralized in the vendored
+        # @codeproxy/core adapter exposed by deepseek-web-api's /v1/responses
+        # route. Keep the older in-process Chat->Responses implementation below
+        # temporarily as unreachable rollback context while the migration is
+        # exercised by the full regression suite.
+        return await self._deepseek_codeproxy_responses(
+            request,
+            body,
+            session,
+            api_key=api_key,
+        )
 
         use_pro = str(body.get("model") or "").lower() == DEEPSEEK_MODEL_PRO
         ds_model = DEEPSEEK_MODEL_PRO if use_pro else DEEPSEEK_MODEL_STANDARD
@@ -1510,6 +1797,7 @@ class ShimServer:
 
         # Convert to chat completions format
         forwarded_body = _sanitize_deepseek_body(body)
+        project_hint = _deepseek_codegraph_project_hint(body)
         chat_body = responses_to_chat(forwarded_body, ds_model)
         chat_body["stream"] = body.get("stream", True)
 
@@ -1529,25 +1817,50 @@ class ShimServer:
                 timeout=120,
             )
         except _asyncio.TimeoutError:
-            print(f"[shim] ⚠️  DeepSeek TIMEOUT after 120s, falling back to Claude", flush=True)
-            return await self._claude_gateway_fallback(request, body, response_model_override="deepseek") or \
-                   await self._openai_api_fallback(request, body, response_model_override="deepseek")
+            raise web.HTTPGatewayTimeout(
+                text=(
+                    "DeepSeek timed out after 120 seconds; explicit DeepSeek requests "
+                    "will not switch models"
+                )
+            )
         except Exception as e:
-            print(f"[shim] ⚠️  DeepSeek connection error: {e}, falling back to Claude", flush=True)
-            return await self._claude_gateway_fallback(request, body, response_model_override="deepseek") or \
-                   await self._openai_api_fallback(request, body, response_model_override="deepseek")
+            raise web.HTTPBadGateway(
+                text=(
+                    f"DeepSeek connection error: {e}; explicit DeepSeek requests "
+                    "will not switch models"
+                )
+            )
 
         t1 = time.time()
         print(f"[shim] DeepSeek status={upstream.status} elapsed={t1-t0:.2f}s model={ds_model}", flush=True)
 
         if upstream.status >= 400:
             err_text = await upstream.text()
-            print(f"[shim] ⚠️  DeepSeek error: {err_text[:300]}, falling back to Claude", flush=True)
-            return await self._claude_gateway_fallback(request, body, response_model_override="deepseek") or \
-                   await self._openai_api_fallback(request, body, response_model_override="deepseek")
+            raise web.HTTPBadGateway(
+                text=(
+                    f"DeepSeek upstream error ({upstream.status}): {err_text[:500]}; "
+                    "explicit DeepSeek requests will not switch models"
+                )
+            )
 
         # Handle streaming response
         if chat_body.get("stream"):
+            lines_iter = _sse_lines(upstream)
+            try:
+                first_line = await anext(lines_iter)
+            except StopAsyncIteration:
+                first_line = "[DONE]"
+
+            early_failure = _deepseek_stream_failure(first_line)
+            if early_failure:
+                upstream.release()
+                raise web.HTTPBadGateway(
+                    text=(
+                        f"DeepSeek ended before usable output: {early_failure}; "
+                        "explicit DeepSeek requests will not switch models"
+                    )
+                )
+
             response = _sse_response()
             await response.prepare(request)
 
@@ -1561,21 +1874,46 @@ class ShimServer:
             recovered_tool_index = 10000
             try:
                 await state.start(response)
-                async for line in _sse_lines(upstream):
+                line = first_line
+                while True:
                     if line == "[DONE]":
                         print(f"[shim] DeepSeek stream done, chunks={chunk_count} content_len={len(state.message_text)}", flush=True)
                         break
                     try:
                         chunk = json.loads(line)
                     except json.JSONDecodeError:
-                        continue
+                        chunk = {}
                     chunk_count += 1
+                    if isinstance(chunk.get("error"), dict):
+                        error_message = str(
+                            chunk["error"].get("message")
+                            or "DeepSeek Web returned an empty error"
+                        )
+                        print(
+                            f"[shim] DeepSeek upstream stream error: {error_message}",
+                            flush=True,
+                        )
+                        await state.write_chat_delta(
+                            response,
+                            {
+                                "choices": [
+                                    {
+                                        "delta": {
+                                            "content": (
+                                                "[deepseek] DeepSeek Web failed: "
+                                                f"{error_message}. Please retry this turn."
+                                            )
+                                        },
+                                        "finish_reason": "stop",
+                                    }
+                                ]
+                            },
+                        )
+                        break
 
                     # Extract delta content
                     choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
+                    delta = choices[0].get("delta") or {} if choices else {}
                     content = delta.get("content") or ""
 
                     # Never expose DeepSeek's malformed XML tool protocol to
@@ -1602,14 +1940,23 @@ class ShimServer:
                         content = ""
 
                     if delta.get("tool_calls"):
-                        self._sanitize_deepseek_delta_tool_calls(delta, tool_schemas)
+                        self._sanitize_deepseek_delta_tool_calls(
+                            delta,
+                            tool_schemas,
+                            project_hint,
+                        )
 
                     # Inject source tag before first content.
                     if content and not source_injected:
                         source_injected = True
                         delta["content"] = f"{source_tag} {content}"
 
-                    await state.write_chat_delta(response, chunk)
+                    if choices:
+                        await state.write_chat_delta(response, chunk)
+                    try:
+                        line = await anext(lines_iter)
+                    except StopAsyncIteration:
+                        break
 
                 await state.finish(response)
             except Exception as e:
@@ -1655,7 +2002,11 @@ class ShimServer:
             if not isinstance(name, str) or not name or not isinstance(arguments, str):
                 continue
             normalized = {"tool_calls": [call]}
-            self._sanitize_deepseek_delta_tool_calls(normalized, tool_schemas)
+            self._sanitize_deepseek_delta_tool_calls(
+                normalized,
+                tool_schemas,
+                project_hint,
+            )
             sanitized_call = normalized["tool_calls"][0]
             sanitized_function = sanitized_call.get("function") or function
             call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
@@ -1694,6 +2045,90 @@ class ShimServer:
             "usage": payload.get("usage", {}),
         }
         return web.json_response(result)
+
+    async def _deepseek_codeproxy_responses(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        session: ClientSession,
+        *,
+        api_key: str,
+    ) -> web.StreamResponse:
+        """Proxy Responses traffic through the vendored codeproxy adapter."""
+        use_pro = str(body.get("model") or "").lower() == DEEPSEEK_MODEL_PRO
+        ds_model = DEEPSEEK_MODEL_PRO if use_pro else DEEPSEEK_MODEL_STANDARD
+        forwarded_body = _sanitize_deepseek_body(body)
+        forwarded_body["model"] = ds_model
+        forwarded_body["stream"] = body.get("stream", True)
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{DEEPSEEK_API_BASE}/v1/responses"
+        t0 = time.time()
+
+        import asyncio as _asyncio
+
+        try:
+            upstream = await _asyncio.wait_for(
+                session.post(url, json=forwarded_body, headers=headers),
+                timeout=120,
+            )
+        except _asyncio.TimeoutError:
+            raise web.HTTPGatewayTimeout(
+                text=(
+                    "DeepSeek timed out after 120 seconds; explicit DeepSeek "
+                    "requests will not switch models"
+                )
+            )
+        except Exception as exc:
+            raise web.HTTPBadGateway(
+                text=(
+                    f"DeepSeek connection error: {exc}; explicit DeepSeek "
+                    "requests will not switch models"
+                )
+            )
+
+        print(
+            f"[shim] DeepSeek codeproxy status={upstream.status} "
+            f"elapsed={time.time() - t0:.2f}s model={ds_model}",
+            flush=True,
+        )
+        if upstream.status >= 400:
+            err_text = await upstream.text()
+            raise web.HTTPBadGateway(
+                text=f"DeepSeek Web failed ({upstream.status}): {err_text}"
+            )
+
+        if forwarded_body["stream"] is not True:
+            try:
+                payload = await upstream.json()
+            except Exception:
+                payload = json.loads(await upstream.text())
+            return web.json_response(payload)
+
+        downstream = web.StreamResponse(
+            status=upstream.status,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await downstream.prepare(request)
+        try:
+            async for chunk in upstream.content.iter_any():
+                await downstream.write(chunk)
+        except (ConnectionResetError, _asyncio.CancelledError):
+            upstream.close()
+            raise
+        finally:
+            if not upstream.closed:
+                upstream.close()
+        await downstream.write_eof()
+        return downstream
+
     async def _claude_gateway_fallback(
         self,
         request: web.Request,
@@ -1716,6 +2151,12 @@ class ShimServer:
         ).strip()
 
         chat_body = responses_to_chat(body, claude_model)
+        claude_tool_count = _add_claude_execution_guidance(chat_body, body)
+        if claude_tool_count >= CLAUDE_LOOP_BREAK_TOOL_THRESHOLD:
+            print(
+                f"[shim] Claude loop breaker injected after {claude_tool_count} tool calls",
+                flush=True,
+            )
         chat_body["stream"] = True
         if not chat_body.get("tools") and "parallel_tool_calls" in chat_body:
             del chat_body["parallel_tool_calls"]
@@ -1767,6 +2208,7 @@ class ShimServer:
 
         chunk_count = 0
         source_injected = False
+        pending_content = ""
         try:
             await state.start(response)
             async for line in _sse_lines(upstream):
@@ -1784,13 +2226,43 @@ class ShimServer:
                 if chunk_count == 0:
                     print(f"[shim] CLAUDE first delta keys: {list(delta.keys())} finish_reason={choices[0].get('finish_reason')}", flush=True)
                 chunk_count += 1
-                if not source_injected and delta.get("content"):
-                    source_injected = True
+                content = delta.get("content")
+                if isinstance(content, str) and not source_injected:
+                    pending_content += content
+                    delta = dict(delta)
+                    delta.pop("content", None)
+                    candidate = pending_content.strip().lower()
+                    if candidate and not "(empty placeholder)".startswith(candidate):
+                        source_injected = True
+                        delta["content"] = "[Claude] " + pending_content
+                        pending_content = ""
+                    chunk = dict(chunk)
+                    chunk["choices"] = [dict(choices[0], delta=delta)]
+                await state.write_chat_delta(response, chunk)
+            if pending_content:
+                if pending_content.strip().lower() == "(empty placeholder)":
+                    if not state.tool_calls:
+                        await state.write_chat_delta(
+                            response,
+                            {
+                                "choices": [
+                                    {
+                                        "delta": {
+                                            "content": "[Claude] Claude 未生成有效回复，请重试本轮。"
+                                        }
+                                    }
+                                ]
+                            },
+                        )
+                else:
                     await state.write_chat_delta(
                         response,
-                        {"choices": [{"delta": {"content": "[Claude] "}}]},
+                        {
+                            "choices": [
+                                {"delta": {"content": "[Claude] " + pending_content}}
+                            ]
+                        },
                     )
-                await state.write_chat_delta(response, chunk)
             await state.finish(response)
         except ClientDisconnected:
             pass
@@ -1933,8 +2405,16 @@ class ShimServer:
         if not access_token:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
-        original_model = str(forwarded.get("model") or "gpt-5.5")
-        forwarded["model"] = CHATGPT_MODEL_SLUG  # First try: configured model (gpt-5.6-sol)
+        requested_model = str(forwarded.get("model") or CHATGPT_MODEL_SLUG)
+        original_model = (
+            upstream_model
+            or (
+                chatgpt_upstream_model(requested_model)
+                if is_chatgpt_passthrough_slug(requested_model)
+                else CHATGPT_MODEL_SLUG
+            )
+        )
+        forwarded["model"] = original_model
         forwarded.pop("stream", None)
         forwarded.pop("store", None)
         headers = {
@@ -1951,11 +2431,12 @@ class ShimServer:
         from aiohttp import ClientConnectorError, ServerDisconnectedError, ClientOSError
         session = await self._get_session()
 
-        # Two-stage ChatGPT attempt: first gpt-5.6-sol, then original client model
+        # Honor an explicitly selected ChatGPT model first. The configured
+        # default remains a capacity fallback for compatible requests.
         # Fallback models will be added dynamically if "at capacity" error is detected
-        models_to_try = [CHATGPT_MODEL_SLUG]
-        if original_model != CHATGPT_MODEL_SLUG:
-            models_to_try.append(original_model)
+        models_to_try = [original_model]
+        if CHATGPT_MODEL_SLUG != original_model:
+            models_to_try.append(CHATGPT_MODEL_SLUG)
         capacity_fallbacks_added = False
 
         model_idx = 0
@@ -2401,17 +2882,50 @@ class ShimServer:
 _DROP_ITEM = object()
 
 
+def _prime_loopback_platform(request: web.Request) -> str | None:
+    header_platform = str(
+        request.headers.get("x-codex-shim-platform", "") or ""
+    ).strip().lower()
+    bearer_identity = request.headers.get("Authorization") == (
+        "Bearer local-codex-shim-chatgpt"
+    )
+    if not header_platform and not bearer_identity:
+        return None
+
+    peername = request.transport.get_extra_info("peername") if request.transport else None
+    peer_host = peername[0] if isinstance(peername, tuple) and peername else ""
+    try:
+        is_loopback = ipaddress.ip_address(peer_host).is_loopback
+    except ValueError:
+        is_loopback = peer_host == "localhost"
+    if not is_loopback:
+        raise web.HTTPForbidden(
+            text="Prime Codex-shim routing identity is loopback-only"
+        )
+    if bearer_identity:
+        return "chatgpt"
+    return header_platform
+
+
 def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """Check for platform prefix like [deepseek], [deepseek-pro], [chatgpt] in user message.
+    """Use the newest platform prefix found in the replayed user prompt history.
 
     Returns (modified_body, platform) where platform is one of:
     - "deepseek" for [deepseek]
     - "deepseek-pro" for [deepseek-pro]
     - "chatgpt" for [chatgpt]
+    - "claude" for [claude], [claud], or [kiro]
     - None if no prefix found
     """
     import re
-    prefix_pattern = re.compile(r'^\s*\[(deepseek-pro|deepseek|chatgpt)\]\s*', re.IGNORECASE)
+    prefix_pattern = re.compile(
+        r'^\s*\[(deepseek-pro|deepseek|chatgpt|claude|claud|kiro)\]\s*',
+        re.IGNORECASE,
+    )
+
+    def normalize_platform(value: str) -> str:
+        platform = value.lower()
+        return "claude" if platform in {"claud", "kiro"} else platform
 
     input_data = body.get("input")
     if not input_data:
@@ -2421,16 +2935,15 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
     if isinstance(input_data, str):
         match = prefix_pattern.match(input_data)
         if match:
-            platform = match.group(1).lower()
+            platform = normalize_platform(match.group(1))
             new_body = dict(body)
             new_body["input"] = input_data[match.end():].lstrip()
             return new_body, platform
         return body, None
 
-    # Handle list input. Codex resends the full conversation on every turn,
-    # but a platform prefix is a one-turn instruction: only inspect the latest
-    # user message. Reusing an older [chatgpt] prefix would make ChatGPT sticky
-    # and defeat the default Claude/Kiro route.
+    # Codex resends the conversation on every turn. Search user messages in
+    # reverse order so a newer explicit prefix switches the remembered session
+    # platform, even when later synthetic/unprefixed user items are appended.
     if isinstance(input_data, list):
         for i in range(len(input_data) - 1, -1, -1):
             item = input_data[i]
@@ -2443,7 +2956,7 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
             if isinstance(content, str):
                 match = prefix_pattern.match(content)
                 if match:
-                    platform = match.group(1).lower()
+                    platform = normalize_platform(match.group(1))
                     new_body = dict(body)
                     new_input = list(input_data)
                     new_item = dict(item)
@@ -2462,7 +2975,7 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
                         continue
                     match = prefix_pattern.match(text)
                     if match:
-                        platform = match.group(1).lower()
+                        platform = normalize_platform(match.group(1))
                         new_body = dict(body)
                         new_input = list(input_data)
                         new_item = dict(item)
@@ -2475,9 +2988,6 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
                         new_input[i] = new_item
                         new_body["input"] = new_input
                         return new_body, platform
-            # This is the latest user message. If it has no prefix, older
-            # messages must not influence routing for the current turn.
-            return body, None
 
     return body, None
 
@@ -2561,6 +3071,183 @@ def _compact_deepseek_value(value: Any) -> Any:
     return compacted
 
 
+def _deepseek_codegraph_project_hint(body: dict[str, Any]) -> str | None:
+    """Infer the intended indexed project from environment context and task text."""
+    texts = [
+        _deepseek_item_text(item)
+        for item in body.get("input") or []
+        if isinstance(item, dict)
+    ]
+    joined = "\n".join(texts)
+    cwd_matches = re.findall(r"<cwd>\s*([^<]+?)\s*</cwd>", joined, re.IGNORECASE)
+    cwd = cwd_matches[-1].strip() if cwd_matches else ""
+
+    absolute_candidates = re.findall(r"(?<![\w.-])(/[^\s<>'\"`]+)", joined)
+    for raw_candidate in reversed(absolute_candidates):
+        candidate = raw_candidate.rstrip(".,:;)]}")
+        path = Path(candidate)
+        if path.name == ".codegraph":
+            path = path.parent
+        if (path / ".codegraph").is_dir():
+            return str(path)
+        if path.is_file() and (path.parent / ".codegraph").is_dir():
+            return str(path.parent)
+
+    project_names: list[str] = []
+    for pattern in (
+        r"(?:在|in)\s*([A-Za-z0-9_.-]+)\s*(?:中|里|project|repo|\b)",
+        r"\b([A-Za-z0-9_.-]+)/(?:apps|src|service|common|tests?)\b",
+    ):
+        project_names.extend(re.findall(pattern, joined, re.IGNORECASE))
+
+    if cwd:
+        cwd_path = Path(cwd)
+        if (cwd_path / ".codegraph").is_dir():
+            return str(cwd_path)
+        for project_name in reversed(project_names):
+            candidate = cwd_path / project_name
+            if (candidate / ".codegraph").is_dir():
+                return str(candidate)
+        indexed_children = [
+            marker.parent
+            for marker in cwd_path.glob("*/.codegraph")
+            if marker.is_dir()
+        ]
+        if len(indexed_children) == 1:
+            return str(indexed_children[0])
+    return None
+
+
+def _expand_deepseek_namespace_tools(
+    tools: list[dict[str, Any]],
+    project_hint: str | None,
+) -> list[dict[str, Any]]:
+    """Expose concrete callable tools instead of opaque MCP namespaces."""
+    tool_names = {
+        str(
+            tool.get("name")
+            or (
+                tool.get("function", {}).get("name")
+                if isinstance(tool.get("function"), dict)
+                else ""
+            )
+        )
+        for tool in tools
+    }
+    if "exec_command" not in tool_names:
+        return tools
+
+    expanded: list[dict[str, Any]] = []
+    has_codegraph_function = "codegraph_explore" in tool_names
+    for tool in tools:
+        if (
+            tool.get("type") == "namespace"
+            and str(tool.get("name") or "") in {"mcp__codegraph__", "mcp__codegraph"}
+        ):
+            if not has_codegraph_function:
+                project_note = (
+                    f" Default projectPath for this task: {project_hint}."
+                    if project_hint
+                    else ""
+                )
+                expanded.append(
+                    {
+                        "type": "function",
+                        "name": "codegraph_explore",
+                        "description": (
+                            "Explore an indexed codebase before grep/read. Supply a focused "
+                            "query naming relevant symbols or the code flow."
+                            f"{project_note}"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "projectPath": {
+                                    "type": "string",
+                                    "description": "Absolute indexed project directory.",
+                                },
+                                "query": {
+                                    "type": "string",
+                                    "description": "Symbols or code-flow question to explore.",
+                                },
+                                "maxFiles": {
+                                    "type": "integer",
+                                    "description": "Maximum source files to return.",
+                                },
+                            },
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                    }
+                )
+                has_codegraph_function = True
+            continue
+        expanded.append(tool)
+    return expanded
+
+
+def _hydrate_deepseek_namespace_tools(
+    tools: list[dict[str, Any]],
+    project_hint: str | None,
+) -> list[dict[str, Any]]:
+    """Give opaque CodeGraph namespaces concrete children for codeproxy."""
+    hydrated: list[dict[str, Any]] = []
+    for tool in tools:
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type") != "namespace"
+            or str(tool.get("name") or "") not in {"mcp__codegraph__", "mcp__codegraph"}
+        ):
+            hydrated.append(tool)
+            continue
+
+        namespace = dict(tool)
+        children = namespace.get("tools")
+        if not isinstance(children, list) or not children:
+            project_note = (
+                f" Default projectPath for this task: {project_hint}."
+                if project_hint
+                else ""
+            )
+            namespace["tools"] = [
+                {
+                    "type": "function",
+                    "name": "codegraph_explore",
+                    "description": (
+                        "Explore an indexed codebase before grep/read. Supply a focused "
+                        "query naming relevant symbols or the code flow."
+                        f"{project_note}"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "projectPath": {
+                                "type": "string",
+                                "description": "Absolute indexed project directory.",
+                                **(
+                                    {"default": project_hint}
+                                    if project_hint
+                                    else {}
+                                ),
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "Symbols or code-flow question to explore.",
+                            },
+                            "maxFiles": {
+                                "type": "integer",
+                                "description": "Maximum source files to return.",
+                            },
+                        },
+                        "required": ["query", "projectPath"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        hydrated.append(namespace)
+    return hydrated
+
+
 def _deepseek_tool_is_relevant(tool: dict[str, Any], latest_user_text: str) -> bool:
     """Drop only very large optional namespaces that are clearly unrelated."""
     if tool.get("type") != "namespace":
@@ -2596,21 +3283,11 @@ def _is_deepseek_continuation(text: str) -> bool:
 def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
     """Keep the current task/tool chain small enough for DeepSeek Web."""
     sanitized = json.loads(json.dumps(body))
-    agent_rules = (
-        "DeepSeek Codex execution rules:\n"
-        "- When asked to modify or fix a project, continue using tools until code is changed and tests or a concrete verification run.\n"
-        "- Do not end while an update_plan item is still in_progress or while the requested modification is unverified.\n"
-        "- Do not repeatedly read the same successful file/range. After enough evidence, edit the code or report a specific blocker.\n"
-        "- If a tool call fails because of arguments, immediately retry with only valid required arguments.\n"
-        "- Keep every integer tool argument as an integer, never as a decimal such as 20000.0.\n"
-        "- Stay in the request's current project/workdir. Never scan / or unrelated repositories to guess the task.\n"
-        "- A progress list, artifact list, or source list is not a completed implementation."
-    )
     existing_instructions = sanitized.get("instructions")
     sanitized["instructions"] = (
-        f"{existing_instructions}\n\n{agent_rules}"
+        f"{existing_instructions}\n\n{DEEPSEEK_EXECUTION_RULES}"
         if isinstance(existing_instructions, str) and existing_instructions.strip()
-        else agent_rules
+        else DEEPSEEK_EXECUTION_RULES
     )
     input_items = sanitized.get("input")
     if not isinstance(input_items, list):
@@ -2622,6 +3299,7 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(item, dict) and item.get("role") == "user":
             user_indices.append(index)
     latest_user_index = user_indices[-1] if user_indices else None
+    current_user_index = latest_user_index
     if latest_user_index is not None:
         latest_user_item = input_items[latest_user_index]
         latest_user_text = _deepseek_item_text(latest_user_item)
@@ -2643,6 +3321,7 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
     # the DSL, code, or decision they refer to. Older tool transcripts are
     # intentionally dropped; only the active task's tool chain is replayed.
     context_start_index = latest_user_index
+    tool_history_start_index = latest_user_index
     if latest_user_index is not None:
         anchor_position = max(
             index
@@ -2651,13 +3330,27 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
         )
         context_position = max(0, anchor_position - 5)
         context_start_index = user_indices[context_position]
-        active_offset = latest_user_index - context_start_index
+        if current_user_index != latest_user_index:
+            # A continuation such as "继续修复" depends on the full tool chain
+            # since the concrete task it refers to.
+            tool_history_start_index = latest_user_index
+        else:
+            # For a normal follow-up, keep the immediately preceding turn's
+            # tool calls/results. They contain the files inspected, edits made,
+            # and verification results that the new request refers to.
+            current_position = len(user_indices) - 1
+            previous_position = max(0, current_position - 1)
+            tool_history_start_index = user_indices[previous_position]
+        tool_history_offset = tool_history_start_index - context_start_index
+        current_turn_offset = current_user_index - context_start_index
         input_items = input_items[context_start_index:]
     elif len(input_items) > 40:
-        active_offset = 0
+        tool_history_offset = 0
+        current_turn_offset = 0
         input_items = input_items[-40:]
     else:
-        active_offset = 0
+        tool_history_offset = 0
+        current_turn_offset = 0
 
     cleaned_items: list[Any] = []
     tool_output_indices = [
@@ -2671,7 +3364,7 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict):
             cleaned_items.append(item)
             continue
-        if index < active_offset and item.get("type") in {
+        if index < tool_history_offset and item.get("type") in {
             "function_call",
             "function_call_output",
             "custom_tool_call",
@@ -2686,7 +3379,7 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
         if cleaned.get("role") == "user":
             _truncate_deepseek_message(
                 cleaned,
-                16_000 if index >= active_offset else 8_000,
+                16_000 if index >= current_turn_offset else 8_000,
             )
         elif cleaned.get("role") == "assistant":
             _truncate_deepseek_message(cleaned, 6_000)
@@ -2704,7 +3397,15 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(tool, dict)
             or _deepseek_tool_is_relevant(tool, latest_user_text)
         ]
-        sanitized["tools"] = _compact_deepseek_value(relevant_tools)
+        # Keep native namespace tools intact. The vendored @codeproxy/core
+        # adapter now owns namespace flattening, upstream-safe name
+        # sanitization, and restoration in Responses events.
+        project_hint = _deepseek_codegraph_project_hint(body)
+        hydrated_tools = _hydrate_deepseek_namespace_tools(
+            relevant_tools,
+            project_hint,
+        )
+        sanitized["tools"] = _compact_deepseek_value(hydrated_tools)
 
     before_size = len(json.dumps(body, ensure_ascii=False))
     after_size = len(json.dumps(sanitized, ensure_ascii=False))
@@ -3389,6 +4090,8 @@ class ResponsesStreamState:
         state["closed"] = True
         if state.get("output_type") == "custom_tool_call":
             custom_input = _custom_tool_input(state["arguments"])
+            if state.get("name") == "apply_patch":
+                custom_input = _normalize_apply_patch_input(custom_input)
             state["input"] = custom_input
             await _write_sse(
                 response,
@@ -3616,6 +4319,106 @@ def _custom_tool_input(arguments: str) -> str:
             if isinstance(value, str):
                 return value
     return arguments
+
+
+def _normalize_apply_patch_input(arguments: str) -> str:
+    """Normalize common Claude patch dialects into Codex apply_patch grammar."""
+    patch = _custom_tool_input(arguments).strip()
+    fenced = re.fullmatch(
+        r"```(?:diff|patch)?\s*\n([\s\S]*?)\n```",
+        patch,
+        re.IGNORECASE,
+    )
+    if fenced:
+        patch = fenced.group(1).strip()
+
+    begin = patch.find("*** Begin Patch")
+    end = patch.rfind("*** End Patch")
+    if begin >= 0:
+        patch = patch[begin:]
+    if end >= 0:
+        patch = patch[: end + len("*** End Patch")]
+
+    lines = patch.splitlines()
+    normalized: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if re.match(
+            r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@(?:\s+.*)?$",
+            line,
+        ):
+            normalized.append("@@")
+            index += 1
+            continue
+        update_match = re.match(
+            r"^\*\*\* Update(?:\s+\d+)?(?: File)?:\s*(.+)$",
+            line,
+        )
+        if update_match:
+            normalized.append(f"*** Update File: {update_match.group(1).strip()}")
+            index += 1
+            continue
+        if re.match(
+            r"^\*\*\* Update(?:\s+\d+|\s+Hunk(?::.*)?)?\s*$",
+            line,
+        ):
+            index += 1
+            old_lines: list[str] = []
+            while index < len(lines) and lines[index] != "---":
+                if lines[index].startswith("*** ") or lines[index].startswith("@@"):
+                    break
+                old_lines.append(lines[index])
+                index += 1
+            if index < len(lines) and lines[index] == "---":
+                index += 1
+                new_lines: list[str] = []
+                while index < len(lines) and not (
+                    lines[index].startswith("*** ")
+                    or lines[index].startswith("@@")
+                ):
+                    new_lines.append(lines[index])
+                    index += 1
+                normalized.append("@@")
+                normalized.extend(f"-{value}" for value in old_lines)
+                normalized.extend(f"+{value}" for value in new_lines)
+            else:
+                normalized.append("@@")
+                normalized.extend(old_lines)
+            continue
+        if re.match(r"^\*\*\* Hunk(?:\s+\d+)?(?::.*)?$", line):
+            normalized.append("@@")
+            index += 1
+            continue
+        if re.match(r"^\*\*\* Find:?\s*$", line):
+            old_lines: list[str] = []
+            index += 1
+            while index < len(lines) and not re.match(
+                r"^\*\*\* Replace:?\s*$",
+                lines[index],
+            ):
+                old_lines.append(lines[index])
+                index += 1
+            if index >= len(lines):
+                normalized.append(line)
+                normalized.extend(old_lines)
+                break
+            index += 1
+            new_lines: list[str] = []
+            while index < len(lines) and not (
+                lines[index].startswith("*** ")
+                or lines[index].startswith("@@")
+            ):
+                new_lines.append(lines[index])
+                index += 1
+            normalized.append("@@")
+            normalized.extend(f"-{value}" for value in old_lines)
+            normalized.extend(f"+{value}" for value in new_lines)
+            continue
+        normalized.append(line)
+        index += 1
+
+    return "\n".join(normalized)
 
 
 def _build_tool_types(body: dict[str, Any]) -> dict[str, str]:
@@ -3996,6 +4799,31 @@ async def _sse_lines(upstream) -> Any:
     tail = buffer.decode("utf-8", errors="replace").strip()
     if tail.startswith("data:"):
         yield tail[5:].strip()
+
+
+def _deepseek_stream_failure(line: str) -> str | None:
+    """Detect a DeepSeek failure before committing the downstream SSE response."""
+    if line == "[DONE]":
+        return "DeepSeek Web returned no stream events"
+    try:
+        chunk = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    error = chunk.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or "DeepSeek Web returned an empty error")
+    choices = chunk.get("choices") or []
+    if not choices:
+        return None
+    delta = choices[0].get("delta") or {}
+    content = str(delta.get("content") or "")
+    legacy_empty = (
+        "DeepSeek Web did not produce a usable tool call or final answer "
+        "after two automatic retries"
+    )
+    if legacy_empty in content:
+        return "DeepSeek Web returned an empty response after automatic retries"
+    return None
 
 
 def _anthropic_stream_to_chat_chunk(event: dict[str, Any], model: str) -> dict[str, Any]:

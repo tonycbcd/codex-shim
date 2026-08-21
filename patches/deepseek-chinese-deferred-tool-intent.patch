@@ -1,0 +1,28 @@
+--- a/vendor/deepseek-web-api/dist/deepseek/toolOutcome.js
++++ b/vendor/deepseek-web-api/dist/deepseek/toolOutcome.js
+@@ -8,9 +8,22 @@ function isDeferredToolIntent(text) {
+     const compact = text.replace(/\s+/g, " ").trim();
+-    if (!compact || compact.length > 320 || text.includes("```"))
++    if (!compact || compact.length > 1200 || text.includes("```"))
+         return false;
+-    const chinese = /^(?:(?:我)?先|我(?:来|会|将|准备)|接下来(?:我)?|现在(?:我)?)(?:先)?(?:看(?:一下)?|检查|查看|读取|搜索|分析|定位|确认|梳理|调查|打开|执行|运行|修改|修复|处理|验证|排查|对比|查找)/;
++    const chinese = /^(?:(?:我)?先|首先(?:我)?|我(?:来|会|将|准备)|接下来(?:我)?|现在(?:我)?)(?:先)?(?:看(?:一下)?|检查|查看|读取|搜索|分析|定位|确认|梳理|调查|打开|执行|运行|修改|修复|处理|验证|排查|对比|查找)/;
+     const english = /^(?:let me|i(?:'ll| will| am going to)|first,?\s+i(?:'ll| will)|next,?\s+i(?:'ll| will))\s+(?:inspect|check|look|read|search|analy[sz]e|review|open|run|investigate|modify|fix|verify)\b/i;
++    const deferredClosing = /(?:请稍等|稍等)[，,\s]*(?:我)?(?:马上|现在|接下来)?(?:会|将)?(?:开始|继续|执行|检查|查看|搜索|处理|修改|修复|验证)/;
++    const stagedCommandPlan = /(?:第一步|第二步|首先|接下来)/.test(compact) &&
++        /(?:^|\n)\s*(?:grep|rg|sed|cat|find|git|php|python3?|node|go|pytest|curl)\b/m.test(text);
+-    return chinese.test(compact) || english.test(compact);
++    const finalSentence = compact
++        .split(/[。！？.!?；;]+/)
++        .map((part) => part.trim())
++        .filter(Boolean)
++        .at(-1) ?? compact;
++    return chinese.test(compact) ||
++        english.test(compact) ||
++        chinese.test(finalSentence) ||
++        english.test(finalSentence) ||
++        deferredClosing.test(compact) ||
++        stagedCommandPlan;
+ }
+ /** Promote reasoning-only prose, preserve tool calls, and identify responses that need one retry. */
+ export function resolveToolTurn(outputText, reasoningText, idSeed, emptyFallback = "", toolDefinitions = []) {

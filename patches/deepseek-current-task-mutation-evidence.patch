@@ -1,0 +1,180 @@
+--- a/vendor/deepseek-web-api/dist/deepseek/client.js
++++ b/vendor/deepseek-web-api/dist/deepseek/client.js
+@@ -16,34 +16,116 @@
+ function requestedCodeMutation(text) {
+     return /(?:修复|修改|改下|实现|添加|新增|删除|移除|更新|直接改|fix|modify|update|implement|add|remove|delete|patch)/i.test(text);
+ }
+-function claimsUnappliedPatch(text) {
++function claimsCompletedMutation(text) {
+     const completedClaim = /(?:已(?:经)?(?:完成|修复|修改|添加|新增|删除|移除|更新|实现)|修改文件|补丁内容|验证：|(?:fixed|modified|updated|implemented|patched)\b)/i.test(text);
+-    const patchEvidence = /(?:^|\n)(?:---\s+(?:a\/|\/)|\+\+\+\s+(?:b\/|\/)|@@\s+-\d|\*\*\* Begin Patch)/m.test(text) ||
+-        /(?:补丁内容|patch content)/i.test(text);
+-    return completedClaim && patchEvidence;
++    const explicitlyNotApplied = /(?:未|没有|尚未|并未|无法|不能)(?:实际)?(?:修改|写入|应用|执行|完成)|(?:只|仅)(?:提供|给出)(?:方案|建议|补丁)|not (?:yet )?(?:applied|modified|implemented)|unable to (?:apply|modify|write)/i.test(text);
++    return completedClaim && !explicitlyNotApplied;
+ }
+ function commandMutatesFiles(command) {
+     return /(?:\bapply_patch\b|(?:^|[;&|]\s*)(?:sed|perl)\b[^\n]*(?:\s-i\b|\s--in-place\b)|\b(?:tee|truncate|touch|mv|cp|rm)\b|(?:^|[;&|]\s*)cat\b[^\n]*(?:>>?|<<)|file_put_contents\s*\(|(?:write_text|write_bytes)\s*\(|open\s*\([^)]*,\s*["'][wa])/i.test(command);
+ }
++function commandVerifiesFiles(command) {
++    return /(?:\bgit\s+(?:diff|status)\b|\b(?:cat|grep|rg|head|tail)\b|\bsed\s+-n\b|\b(?:pytest|phpunit|vitest|jest)\b|\b(?:npm|pnpm)\s+test\b)/i.test(command);
++}
++function toolCallName(call) {
++    return String(call.function?.name ?? "");
++}
++function toolCallArguments(call) {
++    try {
++        return JSON.parse(call.function?.arguments ?? "{}");
++    }
++    catch {
++        return {};
++    }
++}
++function toolCallMutatesFiles(call) {
++    const name = toolCallName(call);
++    const args = toolCallArguments(call);
++    if (name === "write_stdin")
++        return typeof args.chars === "string" && args.chars.length > 0;
++    if (/(?:apply_patch|write|edit|create|delete|move)/i.test(name))
++        return true;
++    return name === "exec_command" && typeof args.cmd === "string" && commandMutatesFiles(args.cmd);
++}
++function toolCallVerifiesFiles(call) {
++    const name = toolCallName(call);
++    if (/(?:read|view)/i.test(name))
++        return true;
++    const args = toolCallArguments(call);
++    return name === "exec_command" && typeof args.cmd === "string" && commandVerifiesFiles(args.cmd);
++}
++function toolResultSucceeded(text) {
++    return !/(?:Process exited with code|exit_code\]\s*)[1-9]\d*|(?:tool|command)\s+(?:failed|error)|Traceback \(most recent call last\)|apply_patch verification failed/i.test(text);
++}
++function continuationRequest(text) {
++    const compact = text
++        .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, " ")
++        .replace(/\s+/g, " ")
++        .trim();
++    return compact.length <= 80 &&
++        /^(?:好|好的|ok|okay)?[，,\s]*(?:继续|接着|重试|再试|你继续|继续修复|继续修改|直接改|直接修改|改到具体代码中|应用这个补丁|apply it|continue|retry)[。.!！]?$/i.test(compact);
++}
++function currentTaskTurns(turns) {
++    const userIndexes = [];
++    turns.forEach((turn, index) => {
++        if (turn?.role === "user")
++            userIndexes.push(index);
++    });
++    if (userIndexes.length === 0)
++        return turns;
++    let userPosition = userIndexes.length - 1;
++    while (userPosition > 0 && continuationRequest(turns[userIndexes[userPosition]]?.content ?? "")) {
++        userPosition -= 1;
++    }
++    return turns.slice(userIndexes[userPosition]);
++}
++function hasVerifiedMutationEvidence(turns, definitions) {
++    let pendingMutation = false;
++    let pendingMutationIncludesVerification = false;
++    let pendingVerification = false;
++    let mutationSucceeded = false;
++    let verificationSucceeded = false;
++    for (const turn of currentTaskTurns(turns)) {
++        if (turn?.role === "assistant") {
++            const parsed = parseToolCalls(turn.content ?? "", "mutation-check", definitions);
++            for (const call of parsed.toolCalls) {
++                if (toolCallMutatesFiles(call)) {
++                    pendingMutation = true;
++                    pendingMutationIncludesVerification = toolCallVerifiesFiles(call);
++                    pendingVerification = false;
++                }
++                else if (mutationSucceeded && toolCallVerifiesFiles(call)) {
++                    pendingVerification = true;
++                }
++            }
++            continue;
++        }
++        if (turn?.role !== "tool")
++            continue;
++        if (pendingMutation) {
++            mutationSucceeded = toolResultSucceeded(turn.content ?? "");
++            verificationSucceeded = mutationSucceeded && pendingMutationIncludesVerification;
++            pendingMutation = false;
++            pendingMutationIncludesVerification = false;
++            if (!mutationSucceeded)
++                verificationSucceeded = false;
++            continue;
++        }
++        if (pendingVerification) {
++            verificationSucceeded = toolResultSucceeded(turn.content ?? "");
++            pendingVerification = false;
++        }
++    }
++    return mutationSucceeded && verificationSucceeded;
++}
+ function hasMutationEvidence(turns, definitions) {
+     for (const turn of turns) {
+         if (turn?.role !== "assistant")
+             continue;
+         const parsed = parseToolCalls(turn.content ?? "", "mutation-check", definitions);
+         for (const call of parsed.toolCalls) {
+-            const name = call.function.name;
+-            if (/(?:apply_patch|write|edit|create|delete|move)/i.test(name) || name === "write_stdin")
++            if (toolCallMutatesFiles(call))
+                 return true;
+-            if (name !== "exec_command")
+-                continue;
+-            try {
+-                const args = JSON.parse(call.function.arguments);
+-                if (typeof args.cmd === "string" && commandMutatesFiles(args.cmd))
+-                    return true;
+-            }
+-            catch {
+-                continue;
+-            }
+         }
+     }
+     return false;
+@@ -157,22 +239,28 @@
+         return { ...previous, run: previousRun, retry: maximumRetries };
+     }
+     assessCompletion(run, attempt) {
++        const previousTurns = this.sessions.get(run.sessionId)?.turns ?? [];
++        const taskTurns = currentTaskTurns([...previousTurns, ...run.requestTurns]);
++        const taskUserText = taskTurns
++            .filter((turn) => turn?.role === "user")
++            .map((turn) => turn.content ?? "")
++            .join("\n");
+         if (attempt.diagnostics.recoverableEmpty ||
+             attempt.diagnostics.toolCallCount > 0 ||
+-            !requestedCodeMutation(run.latestUserText) ||
+-            !claimsUnappliedPatch(attempt.responseText ?? "")) {
++            !requestedCodeMutation(`${taskUserText}\n${run.latestUserText}`) ||
++            !claimsCompletedMutation(attempt.responseText ?? "")) {
+             return attempt;
+         }
+-        const previousTurns = this.sessions.get(run.sessionId)?.turns ?? [];
+-        if (hasMutationEvidence([...previousTurns, ...run.requestTurns], run.toolDefinitions))
++        if (hasVerifiedMutationEvidence(taskTurns, run.toolDefinitions))
+             return attempt;
+         attempt.diagnostics.recoverableEmpty = true;
+         attempt.diagnostics.incompleteMutation = true;
+         attempt.diagnostics.outputPreview = (attempt.responseText ?? "").slice(0, 4000);
+         attempt.diagnostics.outputTail = (attempt.responseText ?? "").slice(-4000);
+-        this.logger.warn("DeepSeek claimed a code change without executing a write-capable tool", {
++        this.logger.warn("DeepSeek claimed a code change without verified write evidence in the current task", {
+             sessionId: run.sessionId,
+             retry: run.retry,
++            mutationSeen: hasMutationEvidence(taskTurns, run.toolDefinitions),
+         });
+         return attempt;
+     }
+--- a/vendor/deepseek-web-api/dist/deepseek/promptBuild.js
++++ b/vendor/deepseek-web-api/dist/deepseek/promptBuild.js
+@@ -267,7 +267,7 @@
+         "Never end with THINK-only and never leave RESPONSE empty.",
+         "Tool arguments MUST satisfy the compact schema below; include every required field.",
+         previousResponseText
+-            ? "The previous response proposed or claimed a code change without executing it. Use that proposal as context and invoke a write-capable tool now."
++            ? "The previous response proposed or claimed a code change without verified execution. Use that proposal as context, invoke a write-capable tool now, then inspect the changed file or git diff before claiming completion."
+             : "",
+         names.length ? `Available tools: ${names.join(", ")}` : "",
+     ].filter(Boolean).join("\n");
