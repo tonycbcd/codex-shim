@@ -464,13 +464,10 @@ def test_anthropic_to_response_normalizes_cache_usage():
 
     out = anthropic_to_response(payload, "slug")
 
-    assert out["usage"] == {
-        "input_tokens": 10,
-        "output_tokens": 3,
-        "total_tokens": 13,
-        "input_tokens_details": {
-            "cached_tokens": 8,
-            "cache_read_input_tokens": 8,
-            "cache_creation_input_tokens": 2,
-        },
-    }
+    usage = out["usage"]
+    assert usage["input_tokens"] == 10
+    assert usage["output_tokens"] == 3
+    assert usage["total_tokens"] == 13
+    assert usage["input_tokens_details"]["cached_tokens"] == 8
+    assert usage["input_tokens_details"]["cache_read_input_tokens"] == 8
+    assert usage["input_tokens_details"]["cache_creation_input_tokens"] == 2

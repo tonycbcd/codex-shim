@@ -173,6 +173,15 @@ DEEPSEEK_EXECUTION_RULES = """DeepSeek Codex execution contract:
 - Stay in the request's current project/workdir. Never scan / or unrelated repositories to guess the task.
 - Final reports for execution tasks must name changed files, summarize the actual diff, list verification commands and their real outcomes, and distinguish pre-existing changes from this task."""
 
+DEEPSEEK_FINISHING_RULES = """DeepSeek convergence rules:
+- This turn is already long. Stop broad exploration now.
+- Do at most one more focused read-only tool call if a single missing fact blocks the answer; otherwise answer immediately from the evidence already collected.
+- Do not continue chaining grep/search/read commands just to gain confidence.
+- If the task is analysis-only, give a concrete conclusion with the exact file/function/field path that should change.
+- If the task is an implementation request and you already know the target file/function, stop analyzing and edit now with apply_patch or one focused exec_command edit.
+- For implementation tasks, at most one final read-only inspection is allowed before editing. If you still cannot identify a concrete patch point after that, stop and report the exact blocker instead of continuing to explore.
+- Never end with another progress update such as “I’ll keep checking” or “I need to inspect more”; end with either a final answer, one concrete blocker, or one concrete tool call."""
+
 
 def _iter_claude_user_text_fragments(value: Any):
     if isinstance(value, str):
@@ -4501,6 +4510,139 @@ def _deepseek_tool_is_relevant(tool: dict[str, Any], latest_user_text: str) -> b
     return True
 
 
+def _deepseek_function_name(item: dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    name = item.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    function = item.get("function")
+    if isinstance(function, dict):
+        value = function.get("name")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _deepseek_is_progress_chatter(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    if not normalized or len(normalized) > 220:
+        return False
+    if re.search(r"(?:/|\\|\.(?:php|js|ts|tsx|py|go|rb|java|sql)\b|::|\bline\b|\bfield\b|=>)", normalized):
+        return False
+    return bool(
+        re.match(
+            r"^(我先|我继续|我再|我需要|继续|先|再|接着|继续看|继续查|继续追|"
+            r"i(?:'ll| will)?\s+(?:check|inspect|look|trace|review|continue)|"
+            r"need to|let me|continuing to|i'm checking)",
+            normalized,
+        )
+    )
+
+
+def _deepseek_tool_call_stats(items: list[Any]) -> dict[str, int]:
+    tool_call_count = 0
+    exploratory_calls = 0
+    recent_exploratory_streak = 0
+    edit_attempts = 0
+    recent_activity: list[bool] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type not in {"function_call", "custom_tool_call"}:
+            continue
+        tool_call_count += 1
+        name = _deepseek_function_name(item).lower()
+        arguments_blob = ""
+        for key in ("arguments", "input"):
+            value = item.get(key)
+            if isinstance(value, str):
+                arguments_blob += "\n" + value
+        lowered = arguments_blob.lower()
+        exploratory = False
+        if name in {"codegraph_explore", "find", "search_query", "open", "click", "find_empty_space_on_canvas", "batch_get"}:
+            exploratory = True
+        elif name == "exec_command":
+            if re.search(r"\b(rg|grep|find|ls|pwd|sed|cat|head|tail|git status|which)\b", lowered):
+                exploratory = True
+            if re.search(r"\b(apply_patch|perl\s+-0pi|python\s+\S*open\(|node\s+\S*writefile|tee\s+\S+|cp\s+\S+|mv\s+\S+)\b", lowered):
+                edit_attempts += 1
+        elif name == "apply_patch":
+            edit_attempts += 1
+        recent_activity.append(exploratory)
+        if len(recent_activity) > 6:
+            recent_activity.pop(0)
+        if exploratory:
+            exploratory_calls += 1
+    for flag in reversed(recent_activity):
+        if not flag:
+            break
+        recent_exploratory_streak += 1
+    return {
+        "tool_call_count": tool_call_count,
+        "exploratory_calls": exploratory_calls,
+        "recent_exploratory_streak": recent_exploratory_streak,
+        "edit_attempts": edit_attempts,
+    }
+
+
+def _build_deepseek_finish_guidance(input_items: list[Any], latest_user_text: str) -> str | None:
+    stats = _deepseek_tool_call_stats(input_items)
+    tool_call_count = stats["tool_call_count"]
+    exploratory_calls = stats["exploratory_calls"]
+    recent_exploratory_streak = stats["recent_exploratory_streak"]
+    edit_attempts = stats["edit_attempts"]
+    item_count = len(input_items)
+    implementation_task = bool(
+        re.search(
+            r"\b(fix|implement|edit|modify|patch|change|update|write|create|refactor)\b|"
+            r"修|改|实现|补丁|更新|新增|调整",
+            latest_user_text.lower(),
+        )
+    )
+    analysis_only = not implementation_task
+    tool_threshold = 5 if implementation_task else 8
+    exploratory_threshold = 3 if implementation_task else 6
+    streak_threshold = 2 if implementation_task else 4
+    item_threshold = 48 if implementation_task else 80
+    if (
+        tool_call_count < tool_threshold
+        and exploratory_calls < exploratory_threshold
+        and recent_exploratory_streak < streak_threshold
+        and item_count < item_threshold
+    ):
+        return None
+    task_mode = (
+        "This looks analysis-only, so prefer a concrete conclusion now."
+        if analysis_only
+        else "This is an execution task, so either edit now or stop with one exact blocker."
+    )
+    return (
+        f"{DEEPSEEK_FINISHING_RULES}\n"
+        f"- Current pressure: {tool_call_count} tool calls, "
+        f"{exploratory_calls} exploratory calls, recent exploratory streak {recent_exploratory_streak}, "
+        f"{edit_attempts} edit attempts, {item_count} input items.\n"
+        f"- {task_mode}"
+    )
+
+
+def _deepseek_should_force_execution_tools(stats: dict[str, int], latest_user_text: str) -> bool:
+    implementation_task = bool(
+        re.search(
+            r"\b(fix|implement|edit|modify|patch|change|update|write|create|refactor)\b|"
+            r"修|改|实现|补丁|更新|新增|调整",
+            latest_user_text.lower(),
+        )
+    )
+    return bool(
+        implementation_task
+        and stats.get("tool_call_count", 0) >= 6
+        and stats.get("exploratory_calls", 0) >= 4
+        and stats.get("edit_attempts", 0) == 0
+    )
+
+
 def _is_deepseek_continuation(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text.strip().lower())
     if len(normalized) > 100:
@@ -4518,13 +4660,14 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
     """Keep the current task/tool chain small enough for DeepSeek Web."""
     sanitized = json.loads(json.dumps(body))
     existing_instructions = sanitized.get("instructions")
-    sanitized["instructions"] = (
+    instruction_blocks = [
         f"{existing_instructions}\n\n{DEEPSEEK_EXECUTION_RULES}"
         if isinstance(existing_instructions, str) and existing_instructions.strip()
         else DEEPSEEK_EXECUTION_RULES
-    )
+    ]
     input_items = sanitized.get("input")
     if not isinstance(input_items, list):
+        sanitized["instructions"] = "\n\n".join(instruction_blocks)
         return sanitized
 
     user_indices: list[int] = []
@@ -4550,6 +4693,28 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
             latest_user_text = f"{previous_text}\n{continuation_text}"
             if not _is_deepseek_continuation(previous_text):
                 break
+    deepseek_stats = _deepseek_tool_call_stats(input_items)
+    finish_guidance = _build_deepseek_finish_guidance(input_items, latest_user_text)
+    if finish_guidance:
+        instruction_blocks.append(finish_guidance)
+        print(
+            "[shim] DeepSeek finish guidance injected "
+            f"(items={len(input_items)} tool_calls={deepseek_stats['tool_call_count']})",
+            flush=True,
+        )
+    force_execution_tools = _deepseek_should_force_execution_tools(deepseek_stats, latest_user_text)
+    if force_execution_tools:
+        instruction_blocks.append(
+            "DeepSeek execution lock: you have already spent too many tool calls exploring without editing. "
+            "Your next step must be one of: (1) apply_patch, (2) one focused exec_command that edits files, or "
+            "(3) a final blocker message naming the exact file and missing fact. Do not do more search/read-only commands first."
+        )
+        print(
+            "[shim] DeepSeek execution-tool lock enabled "
+            f"(tool_calls={deepseek_stats['tool_call_count']} exploratory={deepseek_stats['exploratory_calls']})",
+            flush=True,
+        )
+    sanitized["instructions"] = "\n\n".join(instruction_blocks)
 
     # Keep several preceding user/assistant turns so follow-up questions retain
     # the DSL, code, or decision they refer to. Older tool transcripts are
@@ -4593,7 +4758,13 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(item, dict)
         and item.get("type") in {"function_call_output", "custom_tool_call_output"}
     ]
-    recent_tool_outputs = set(tool_output_indices[-3:])
+    recent_tool_outputs = set(tool_output_indices[-5:])
+    assistant_indices = [
+        index
+        for index, item in enumerate(input_items)
+        if isinstance(item, dict) and item.get("role") == "assistant"
+    ]
+    recent_assistant_indices = set(assistant_indices[-2:])
     for index, item in enumerate(input_items):
         if not isinstance(item, dict):
             cleaned_items.append(item)
@@ -4610,15 +4781,25 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
         cleaned = dict(item)
         cleaned.pop("encrypted_content", None)
         _strip_deepseek_source_tag(cleaned)
+        if cleaned.get("role") == "assistant":
+            assistant_text = _deepseek_item_text(cleaned)
+            if (
+                index not in recent_assistant_indices
+                and _deepseek_is_progress_chatter(assistant_text)
+            ):
+                continue
         if cleaned.get("role") == "user":
             _truncate_deepseek_message(
                 cleaned,
-                16_000 if index >= current_turn_offset else 8_000,
+                16_000 if index >= current_turn_offset else 6_000,
             )
         elif cleaned.get("role") == "assistant":
-            _truncate_deepseek_message(cleaned, 6_000)
+            _truncate_deepseek_message(
+                cleaned,
+                6_000 if index in recent_assistant_indices else 1_200,
+            )
         if cleaned.get("type") in {"function_call_output", "custom_tool_call_output"}:
-            max_length = 6000 if index in recent_tool_outputs else 2000
+            max_length = 8_000 if index in recent_tool_outputs else 1_200
             _truncate_tool_output(cleaned, max_length)
         cleaned_items.append(cleaned)
     sanitized["input"] = cleaned_items
@@ -4631,6 +4812,29 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(tool, dict)
             or _deepseek_tool_is_relevant(tool, latest_user_text)
         ]
+        if force_execution_tools:
+            execution_tool_names = {
+                "exec_command",
+                "write_stdin",
+                "apply_patch",
+                "update_plan",
+                "request_user_input",
+            }
+            narrowed_tools = []
+            for tool in relevant_tools:
+                if not isinstance(tool, dict):
+                    narrowed_tools.append(tool)
+                    continue
+                tool_name = str(
+                    tool.get("name")
+                    or (tool.get("function") or {}).get("name")
+                    or tool.get("type")
+                    or ""
+                )
+                if tool_name in execution_tool_names:
+                    narrowed_tools.append(tool)
+            if narrowed_tools:
+                relevant_tools = narrowed_tools
         # Keep native namespace tools intact. The vendored @codeproxy/core
         # adapter now owns namespace flattening, upstream-safe name
         # sanitization, and restoration in Responses events.
