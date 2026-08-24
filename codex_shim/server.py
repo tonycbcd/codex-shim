@@ -1966,17 +1966,129 @@ class ShimServer:
     @staticmethod
     def _is_malformed_tool_call(text: str) -> bool:
         """Detect XML-like pseudo tool calls emitted as plain model text."""
-        return bool(
+        if bool(
             re.search(
                 r"(?:<\s*|(?m:^\s*))(?:_?calls?|tool[_-]?calls?|invoke|parameter)\b[^>\n]*>",
                 text,
                 flags=re.IGNORECASE,
             )
+        ):
+            return True
+        if re.search(r'(?is)^\s*```(?:json)?\s*\{[\s\S]*"tool_type"\s*:\s*"[^"]+"', text):
+            return True
+        if re.search(r'(?is)^\s*\{[\s\S]*"tool_type"\s*:\s*"[^"]+"', text):
+            return True
+        return bool(
+            re.search(r'(?is)^\s*\{[\s\S]*"(?:name|function)"\s*:', text)
         )
 
     @staticmethod
     def _recover_deepseek_tool_calls(text: str) -> list[dict[str, Any]]:
-        """Recover common DeepSeek XML tool-call variants missed upstream."""
+        """Recover common DeepSeek XML/JSON tool-call variants missed upstream."""
+
+        def wrap_call(name: str, arguments: Any, index: int = 0) -> dict[str, Any]:
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (TypeError, ValueError):
+                    arguments = {"input": arguments}
+            elif arguments is None:
+                arguments = {}
+            elif not isinstance(arguments, dict):
+                arguments = {"input": arguments}
+            return {
+                "index": index,
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+                },
+            }
+
+        stripped = text.strip()
+        fenced = re.match(r'^\s*```(?:json)?\s*([\s\S]*?)\s*```\s*$', stripped, re.IGNORECASE)
+        candidate = fenced.group(1).strip() if fenced else stripped
+        direct_json = None
+        try:
+            direct_json, end = json.JSONDecoder().raw_decode(candidate)
+            if isinstance(direct_json, dict) and candidate[end:].strip():
+                direct_json = None
+        except (TypeError, ValueError):
+            direct_json = None
+
+        if isinstance(direct_json, dict):
+            tool_type = direct_json.get("tool_type")
+            function = direct_json.get("function")
+            name = None
+            arguments: Any = None
+            if isinstance(function, dict):
+                name = function.get("name")
+                arguments = function.get("arguments")
+            if not name and isinstance(direct_json.get("name"), str):
+                name = direct_json.get("name")
+                arguments = direct_json.get("arguments")
+            if not name and isinstance(tool_type, str):
+                name = tool_type
+                arguments = {
+                    key: value
+                    for key, value in direct_json.items()
+                    if key not in {"tool_type", "name", "arguments", "function"}
+                }
+            if not name and "cmd" in direct_json:
+                name = "exec_command"
+                arguments = dict(direct_json)
+            if isinstance(name, str) and name.strip():
+                return [wrap_call(name.strip(), arguments, 0)]
+
+        if re.search(r'(?is)"tool_type"\s*:\s*"[^"]+"', candidate):
+            def _extract_jsonish_string(key: str, stop_keys: list[str]) -> str | None:
+                lookahead = "|".join(
+                    rf'"\s*,\s*"{re.escape(next_key)}"\s*:'
+                    for next_key in stop_keys
+                )
+                if not lookahead:
+                    return None
+                pattern = (
+                    rf'(?is)"{re.escape(key)}"\s*:\s*"(?P<value>[\s\S]*?)(?=(?:{lookahead})|\s*\}})'
+                )
+                match = re.search(pattern, candidate)
+                if not match:
+                    return None
+                return match.group("value")
+
+            tool_type_match = re.search(r'(?is)"tool_type"\s*:\s*"([^"]+)"', candidate)
+            if tool_type_match:
+                tool_name = tool_type_match.group(1).strip()
+                jsonish_arguments: dict[str, Any] = {}
+                cmd_value = _extract_jsonish_string(
+                    "cmd",
+                    ["justification", "login", "max_output_tokens", "prefix_rule", "sandbox_permissions", "shell", "tty", "workdir", "yield_time_ms"],
+                )
+                if cmd_value is not None:
+                    jsonish_arguments["cmd"] = cmd_value
+                justification_value = _extract_jsonish_string(
+                    "justification",
+                    ["login", "max_output_tokens", "prefix_rule", "sandbox_permissions", "shell", "tty", "workdir", "yield_time_ms"],
+                )
+                if justification_value is not None:
+                    jsonish_arguments["justification"] = justification_value
+                shell_match = re.search(r'(?is)"shell"\s*:\s*"([^"]*)"', candidate)
+                if shell_match:
+                    jsonish_arguments["shell"] = shell_match.group(1)
+                workdir_match = re.search(r'(?is)"workdir"\s*:\s*"([^"]*)"', candidate)
+                if workdir_match:
+                    jsonish_arguments["workdir"] = workdir_match.group(1)
+                for bool_key in ("login", "tty"):
+                    bool_match = re.search(r'(?is)"' + re.escape(bool_key) + r'"\s*:\s*(true|false)', candidate)
+                    if bool_match:
+                        jsonish_arguments[bool_key] = bool_match.group(1).lower() == "true"
+                for int_key in ("max_output_tokens", "yield_time_ms"):
+                    int_match = re.search(r'(?is)"' + re.escape(int_key) + r'"\s*:\s*(\d+)', candidate)
+                    if int_match:
+                        jsonish_arguments[int_key] = int(int_match.group(1))
+                if jsonish_arguments:
+                    return [wrap_call(tool_name, jsonish_arguments, 0)]
 
         def attribute_name(attributes: str) -> str:
             match = re.search(r'\bname\s*=\s*["\']([^"\']+)["\']', attributes, re.IGNORECASE)
@@ -2079,17 +2191,7 @@ class ShimServer:
             if arguments is None:
                 continue
 
-            calls.append(
-                {
-                    "index": len(calls),
-                    "id": f"call_{uuid.uuid4().hex[:24]}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
-                    },
-                }
-            )
+            calls.append(wrap_call(name, arguments, len(calls)))
 
         # DeepSeek occasionally truncates or corrupts the opening tag while
         # keeping a usable tool name and complete <parameter> children, e.g.
@@ -2103,21 +2205,7 @@ class ShimServer:
             )
             loose_arguments = arguments_from_parameters(normalized_text)
             if loose_open and loose_arguments:
-                calls.append(
-                    {
-                        "index": 0,
-                        "id": f"call_{uuid.uuid4().hex[:24]}",
-                        "type": "function",
-                        "function": {
-                            "name": loose_open.group("name").strip(),
-                            "arguments": json.dumps(
-                                loose_arguments,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            ),
-                        },
-                    }
-                )
+                calls.append(wrap_call(loose_open.group("name").strip(), loose_arguments, 0))
         return calls
 
     @staticmethod
@@ -4158,6 +4246,48 @@ def _strip_deepseek_source_tag(item: dict[str, Any]) -> None:
             if isinstance(part.get(key), str):
                 part[key] = prefix.sub("", part[key], count=1)
                 return
+
+
+def _strip_deepseek_previous_calls_text(text: str) -> str:
+    """Remove DeepSeek's leaked previous_calls / Ran ... transcript artifacts."""
+    if not text:
+        return text
+    cleaned = text
+    cleaned = re.sub(
+        r"(?is)<previous_calls>.*?</previous_calls>",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?im)^\s*\[deepseek(?:-pro)?\]\s*</previous_calls>\s*$",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?im)^\s*</previous_calls>\s*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*<previous_calls>\s*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*Ran\s+.+$", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _sanitize_deepseek_responses_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip DeepSeek adapter transcript leakage from Responses payload text."""
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return payload
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "output_text":
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                part["text"] = _strip_deepseek_previous_calls_text(text)
+    return payload
 
 
 def _compact_deepseek_value(value: Any) -> Any:
