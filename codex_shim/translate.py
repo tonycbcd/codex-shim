@@ -87,6 +87,8 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
 
 def responses_to_anthropic(body: dict[str, Any], upstream_model: str, max_tokens: int | None) -> dict[str, Any]:
     system_parts: list[str] = []
+    anthropic_native = str(upstream_model or "").startswith("us.anthropic.")
+    include_reasoning_blocks = True
     instructions = body.get("instructions")
     if instructions:
         system_parts.append(_content_to_text(instructions))
@@ -103,14 +105,15 @@ def responses_to_anthropic(body: dict[str, Any], upstream_model: str, max_tokens
     for chat_msg in _responses_input_to_messages(body.get("input")):
         role = chat_msg.get("role", "user")
         if chat_msg.get("_reasoning_only"):
+            if not include_reasoning_blocks:
+                continue
             decoded = _decode_thinking_blob(chat_msg.get("encrypted_content"))
             if decoded is not None:
                 pending_thinking.append(decoded)
-            else:
-                # Summary-only fallback: emit a plain `thinking` block (no
-                # signature). Anthropic requires `signature` on the original
-                # session; if we lack it, skip rather than upsetting strict
-                # APIs.
+            elif not anthropic_native:
+                # Summary-only fallback is acceptable for non-Anthropic
+                # upstreams that merely mirror chat-style reasoning, but native
+                # Anthropic / Bedrock APIs require a valid signature on replay.
                 for summary in chat_msg.get("summary") or []:
                     text = summary.get("text") if isinstance(summary, dict) else None
                     if text:
@@ -446,6 +449,7 @@ def normalize_responses_usage(usage: Any) -> dict[str, Any] | None:
         output_details.update(usage["output_tokens_details"])
     if isinstance(usage.get("completion_tokens_details"), dict):
         output_details.update(usage["completion_tokens_details"])
+    output_details.setdefault("reasoning_tokens", 0)
     if output_details:
         normalized["output_tokens_details"] = output_details
 

@@ -147,9 +147,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in {"stop", "disable"}:
         if args.command == "disable":
             restore_codex_config()
-        return stop()
+        return stop(args.port)
     if args.command == "restart":
-        stop()
+        stop(args.port)
         generate(args.settings, args.port)
         return start(args.settings, args.port)
     if args.command == "status":
@@ -619,14 +619,26 @@ def list_models(settings_path: Path) -> int:
     return 0
 
 
+def _preferred_server_python() -> str:
+    current = Path(sys.executable)
+    project_root = Path(__file__).resolve().parent.parent
+    venv_python = project_root / ".venv" / "bin" / "python"
+    if venv_python.exists() and current != venv_python:
+        return str(venv_python)
+    return sys.executable
+
+
 def start(settings_path: Path, port: int) -> int:
-    if _pid_running(_read_pid()):
-        print(f"Shim already running with pid {_read_pid()}.")
+    running_pid = _runtime_pid(port)
+    if running_pid:
+        PID_PATH.write_text(str(running_pid))
+        print(f"Shim already running with pid {running_pid}.")
         return 0
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     log = LOG_PATH.open("ab")
+    python_exec = _preferred_server_python()
     cmd = [
-        sys.executable,
+        python_exec,
         "-m",
         "codex_shim.server",
         "--settings",
@@ -653,12 +665,13 @@ def start(settings_path: Path, port: int) -> int:
     return 1
 
 
-def stop() -> int:
-    pid = _read_pid()
+def stop(port: int = DEFAULT_PORT) -> int:
+    pid = _runtime_pid(port)
     if not _pid_running(pid):
         print("Shim is not running.")
         PID_PATH.unlink(missing_ok=True)
         return 0
+    PID_PATH.write_text(str(pid))
     _terminate_pid(pid)
     for _ in range(50):
         if not _pid_running(pid):
@@ -687,7 +700,7 @@ def restore_codex_config() -> None:
 
 
 def status(port: int) -> int:
-    pid = _read_pid()
+    pid = _runtime_pid(port)
     if _pid_running(pid):
         health = _health(port)
         if health is not None:
@@ -702,7 +715,7 @@ def status(port: int) -> int:
 
 
 def ensure_started(settings_path: Path, port: int) -> None:
-    if not (_pid_running(_read_pid()) and _healthy(port)):
+    if not (_pid_running(_runtime_pid(port)) and _healthy(port)):
         code = start(settings_path, port)
         if code:
             raise SystemExit(code)
@@ -1292,6 +1305,39 @@ def _health(port: int) -> dict | None:
             return json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
+
+
+def _listening_pid(port: int) -> int | None:
+    commands: list[list[str]] = []
+    if shutil.which("lsof"):
+        commands.append(["lsof", "-tiTCP:%d" % port, "-sTCP:LISTEN"])
+    if shutil.which("ss"):
+        commands.append(["ss", "-ltnp", f"sport = :{port}"])
+    for cmd in commands:
+        try:
+            output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            continue
+        if cmd[0] == "lsof":
+            for line in output.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    return int(line)
+            continue
+        match = re.search(r"pid=(\d+)", output)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _runtime_pid(port: int) -> int | None:
+    pid = _read_pid()
+    if _pid_running(pid):
+        return pid
+    port_pid = _listening_pid(port)
+    if _pid_running(port_pid) and _healthy(port):
+        return port_pid
+    return None
 
 
 def _read_pid() -> int | None:

@@ -5,6 +5,7 @@ import asyncio
 import html
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -32,6 +33,8 @@ from . import router as router_module
 from .hostguard import build_allowed_hosts, host_guard_middleware
 from .settings import (
     CHATGPT_MODEL_SLUG,
+    bedrock_aws_profile,
+    bedrock_aws_region,
     DEFAULT_CODEX_AUTH,
     DEFAULT_SETTINGS,
     DEFAULT_HOST,
@@ -77,6 +80,17 @@ DEEPSEEK_SESSIONS_FILE = Path(__file__).resolve().parents[1] / ".deepseek-web-da
 DEEPSEEK_MAX_SESSIONS_BYTES = 32 * 1024 * 1024
 DEEPSEEK_MODEL_STANDARD = "deepseek-v4-flash"
 DEEPSEEK_MODEL_PRO = "deepseek-v4-pro"
+BEDROCK_OPUS_5   = "us.anthropic.claude-opus-5"
+BEDROCK_OPUS_4_8 = "us.anthropic.claude-opus-4-8"
+BEDROCK_OPUS_4_7 = "us.anthropic.claude-opus-4-7"
+BEDROCK_OPUS_4_6 = "us.anthropic.claude-opus-4-6-v1"
+# Mapping from platform prefix to (model_id, source_tag)
+BEDROCK_OPUS_PLATFORMS: dict[str, tuple[str, str]] = {
+    "claude-opus-5":   (BEDROCK_OPUS_5,   "[claude-opus-5]"),
+    "claude-opus-4.8": (BEDROCK_OPUS_4_8, "[claude-opus-4.8]"),
+    "claude-opus-4.7": (BEDROCK_OPUS_4_7, "[claude-opus-4.7]"),
+    "claude-opus-4.6": (BEDROCK_OPUS_4_6, "[claude-opus-4.6]"),
+}
 DEFAULT_CLAUDE_GATEWAY_URL = "http://127.0.0.1:8901/v1/chat/completions"
 # Keep the default on a model the current Kiro subscription can actually use.
 # claude-opus-4.6 returns 400 "Invalid model ID or insufficient subscription
@@ -96,12 +110,49 @@ CLAUDE_EXECUTION_RULES = """Claude Codex execution contract:
 - Preserve unrelated pre-existing changes and identify them separately in the final report."""
 
 CLAUDE_LOOP_BREAK_TOOL_THRESHOLD = 8
+CLAUDE_SCOPE_LOCK_TOOL_THRESHOLD = 12
+CLAUDE_FORCE_FINISH_TOOL_THRESHOLD = 20
 CLAUDE_LOOP_BREAK_RULES = """Claude tool-loop breaker:
 - This turn has already used {tool_count} tool calls.
 - Stop broad exploration and do not reread ranges already inspected.
 - If the requested patch is not yet applied, make the smallest safe edit now with apply_patch.
 - If the patch is already applied, run at most one focused verification command and then give the final answer.
 - Do not announce another plan, restore from a backup, or restart the task from the beginning."""
+CLAUDE_SCOPE_LOCK_RULES = """Claude scope lock:
+- This turn has already used {tool_count} tool calls, so the task must narrow immediately.
+- Do not open new subsystems, new directories, or additional broad searches unless a concrete missing symbol forces it.
+- Work only in the most likely root-cause file(s). Prefer changing exactly one file; do not exceed two touched files unless the diff already proves both are necessary.
+- If the user named a file or directory, treat that path as the hard scope boundary: {scope_hint}.
+- Before any new tool call, decide whether it directly enables the next edit or the final verification. If not, skip it.
+- If root cause is already clear, patch now. If not, summarize the blocker instead of widening the investigation."""
+CLAUDE_FORCE_FINISH_RULES = """Claude finish-now mode:
+- This turn has already used {tool_count} tool calls. No more exploratory tool calls are allowed.
+- Choose exactly one of these actions now: (1) make one final minimal edit, or (2) run one final targeted verification, or (3) report the concrete blocker.
+- Do not inspect additional files, do not expand the plan, and do not continue iterating after that single action.
+- End the turn with a concise final answer that states changed files or the blocker."""
+
+MODEL_TOKEN_PRICING_USD_PER_MILLION: dict[str, dict[str, float | str]] = {
+    "us.anthropic.claude-opus-4-6-v1": {
+        "input": 5.5,
+        "output": 27.5,
+        "label": "Claude Opus 4.6 (Amazon Bedrock Edition)",
+    },
+    "us.anthropic.claude-opus-4-7": {
+        "input": 5.5,
+        "output": 27.5,
+        "label": "Claude Opus 4.7 (Amazon Bedrock Edition)",
+    },
+    "us.anthropic.claude-opus-4-8": {
+        "input": 5.5,
+        "output": 27.5,
+        "label": "Claude Opus 4.8 (Amazon Bedrock Edition)",
+    },
+    "us.anthropic.claude-opus-5": {
+        "input": 5.5,
+        "output": 27.5,
+        "label": "Claude Opus 5 (Amazon Bedrock Edition)",
+    },
+}
 
 CLAUDE_PATCH_FAILURE_RULES = """Claude apply_patch recovery:
 - Previous apply_patch calls in this same task failed validation.
@@ -121,6 +172,60 @@ DEEPSEEK_EXECUTION_RULES = """DeepSeek Codex execution contract:
 - Call configured tool names exactly. For CodeGraph use codegraph_explore with query and projectPath; never call an MCP namespace name directly.
 - Stay in the request's current project/workdir. Never scan / or unrelated repositories to guess the task.
 - Final reports for execution tasks must name changed files, summarize the actual diff, list verification commands and their real outcomes, and distinguish pre-existing changes from this task."""
+
+
+def _iter_claude_user_text_fragments(value: Any):
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            yield stripped
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_claude_user_text_fragments(item)
+        return
+    if not isinstance(value, dict):
+        return
+    item_type = value.get("type")
+    if item_type in {"input_text", "output_text", "text"}:
+        text_value = value.get("text") or value.get("content")
+        if isinstance(text_value, str) and text_value.strip():
+            yield text_value.strip()
+    if item_type == "message":
+        if value.get("role") == "user":
+            content = value.get("content")
+            if isinstance(content, str):
+                if content.strip():
+                    yield content.strip()
+            else:
+                yield from _iter_claude_user_text_fragments(content)
+        return
+    for key in ("content", "text", "input", "message"):
+        nested = value.get(key)
+        if nested is not None:
+            yield from _iter_claude_user_text_fragments(nested)
+
+
+def _claude_scope_hint(body: dict[str, Any]) -> str:
+    texts = list(_iter_claude_user_text_fragments(body.get("input")))
+    if not texts:
+        return "stay inside the smallest obvious local area of the current repository"
+    combined = "\n".join(texts[-6:])
+    path_pattern = re.compile(r'(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+|(?:^|[\s`\'"])\.?/?[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|php|go|rb|java|kt|rs|c|cc|cpp|h|hpp|json|toml|yaml|yml|md|sql|sh)(?=$|[\s`\'"])')
+    matches = []
+    for raw in path_pattern.findall(combined):
+        candidate = raw.strip().strip("`'\"")
+        if candidate and candidate not in matches:
+            matches.append(candidate)
+        if len(matches) >= 3:
+            break
+    if matches:
+        return ", ".join(matches)
+    short_tail = combined.strip().splitlines()[-1].strip() if combined.strip() else ""
+    if short_tail:
+        compact_tail = short_tail[:120]
+        return f"stay within the user-requested area: {compact_tail}"
+    return "stay inside the smallest obvious local area of the current repository"
 
 
 def _claude_current_turn_tool_call_count(body: dict[str, Any]) -> int:
@@ -169,15 +274,29 @@ def _claude_current_turn_failed_patch_count(body: dict[str, Any]) -> int:
     )
 
 
+def _claude_execution_guidance_state(
+    responses_body: dict[str, Any],
+) -> tuple[int, int, str]:
+    tool_count = _claude_current_turn_tool_call_count(responses_body)
+    failed_patch_count = _claude_current_turn_failed_patch_count(responses_body)
+    scope_hint = _claude_scope_hint(responses_body)
+    guidance = CLAUDE_EXECUTION_RULES
+    if failed_patch_count:
+        guidance += "\n\n" + CLAUDE_PATCH_FAILURE_RULES
+    if tool_count >= CLAUDE_LOOP_BREAK_TOOL_THRESHOLD:
+        guidance += "\n\n" + CLAUDE_LOOP_BREAK_RULES.format(tool_count=tool_count)
+    if tool_count >= CLAUDE_SCOPE_LOCK_TOOL_THRESHOLD:
+        guidance += "\n\n" + CLAUDE_SCOPE_LOCK_RULES.format(tool_count=tool_count, scope_hint=scope_hint)
+    if tool_count >= CLAUDE_FORCE_FINISH_TOOL_THRESHOLD:
+        guidance += "\n\n" + CLAUDE_FORCE_FINISH_RULES.format(tool_count=tool_count)
+    return tool_count, failed_patch_count, guidance
+
+
 def _add_claude_execution_guidance(
     chat_body: dict[str, Any],
     responses_body: dict[str, Any],
 ) -> int:
-    tool_count = _claude_current_turn_tool_call_count(responses_body)
-    failed_patch_count = _claude_current_turn_failed_patch_count(responses_body)
-    guidance = CLAUDE_EXECUTION_RULES
-    if failed_patch_count:
-        guidance += "\n\n" + CLAUDE_PATCH_FAILURE_RULES
+    tool_count, failed_patch_count, guidance = _claude_execution_guidance_state(responses_body)
     if failed_patch_count >= 2:
         tools = chat_body.get("tools")
         if isinstance(tools, list):
@@ -190,14 +309,35 @@ def _add_claude_execution_guidance(
                     and tool["function"].get("name") == "apply_patch"
                 )
             ]
-    if tool_count >= CLAUDE_LOOP_BREAK_TOOL_THRESHOLD:
-        guidance += "\n\n" + CLAUDE_LOOP_BREAK_RULES.format(tool_count=tool_count)
-
     messages = chat_body.get("messages")
     if not isinstance(messages, list):
         messages = []
         chat_body["messages"] = messages
     messages.insert(0, {"role": "system", "content": guidance})
+    return tool_count
+
+
+def _add_claude_execution_guidance_anthropic(
+    anthropic_body: dict[str, Any],
+    responses_body: dict[str, Any],
+) -> int:
+    tool_count, failed_patch_count, guidance = _claude_execution_guidance_state(responses_body)
+    if failed_patch_count >= 2:
+        tools = anthropic_body.get("tools")
+        if isinstance(tools, list):
+            anthropic_body["tools"] = [
+                tool
+                for tool in tools
+                if not (
+                    isinstance(tool, dict)
+                    and tool.get("name") == "apply_patch"
+                )
+            ]
+    existing_system = anthropic_body.get("system")
+    if isinstance(existing_system, str) and existing_system.strip():
+        anthropic_body["system"] = guidance + "\n\n" + existing_system
+    else:
+        anthropic_body["system"] = guidance
     return tool_count
 
 
@@ -216,6 +356,7 @@ class ShimServer:
        self._deepseek_idle_handle: asyncio.TimerHandle | None = None
        self._deepseek_idle_seconds: float = 30.0
        self._session_platforms: dict[str, str] = {}
+       self._session_costs: dict[str, dict[str, Any]] = {}
 
     def _resolve_session_platform(
         self,
@@ -249,6 +390,314 @@ class ShimServer:
                 flush=True,
             )
         return platform
+
+    @staticmethod
+    def _float_setting(*values: Any) -> float | None:
+        for value in values:
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                return number
+        return None
+
+    def _session_cost_key(self, request: web.Request) -> str | None:
+        session_id = str(request.headers.get("session_id") or "").strip()
+        return session_id or None
+
+    def _model_token_pricing(
+        self,
+        *,
+        model_name: str,
+        provider: str | None = None,
+        raw: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        raw = raw or {}
+        input_price = self._float_setting(
+            raw.get("input_cost_per_million_tokens"),
+            raw.get("input_cost_per_million_tokens_usd"),
+            raw.get("inputTokenCostPerMillion"),
+        )
+        output_price = self._float_setting(
+            raw.get("output_cost_per_million_tokens"),
+            raw.get("output_cost_per_million_tokens_usd"),
+            raw.get("outputTokenCostPerMillion"),
+        )
+        if input_price is not None and output_price is not None:
+            return {
+                "input": input_price,
+                "output": output_price,
+                "label": str(raw.get("display_name") or model_name),
+                "provider": provider or raw.get("provider") or "",
+                "source": "models.json",
+            }
+
+        built_in = MODEL_TOKEN_PRICING_USD_PER_MILLION.get(model_name)
+        if built_in is None:
+            return None
+        return {
+            "input": float(built_in["input"]),
+            "output": float(built_in["output"]),
+            "label": str(built_in.get("label") or model_name),
+            "provider": provider or raw.get("provider") or "",
+            "source": "builtin",
+        }
+
+    def _record_session_cost(
+        self,
+        request: web.Request,
+        charge_key: str | None,
+        request_cost_usd: float,
+    ) -> float:
+        session_key = self._session_cost_key(request)
+        if not session_key:
+            return request_cost_usd
+
+        entry = self._session_costs.get(session_key)
+        if entry is None:
+            if len(self._session_costs) >= 1024:
+                oldest_key = min(
+                    self._session_costs.items(),
+                    key=lambda item: float(item[1].get("updated_at") or 0.0),
+                )[0]
+                self._session_costs.pop(oldest_key, None)
+            entry = {
+                "total_usd": 0.0,
+                "seen_keys": set(),
+                "seen_order": [],
+                "updated_at": time.time(),
+            }
+            self._session_costs[session_key] = entry
+
+        seen_keys = entry["seen_keys"]
+        if charge_key and charge_key in seen_keys:
+            entry["updated_at"] = time.time()
+            return float(entry["total_usd"])
+
+        entry["total_usd"] = float(entry["total_usd"]) + request_cost_usd
+        entry["updated_at"] = time.time()
+        if charge_key:
+            seen_keys.add(charge_key)
+            entry["seen_order"].append(charge_key)
+            while len(entry["seen_order"]) > 4096:
+                stale = entry["seen_order"].pop(0)
+                seen_keys.discard(stale)
+        return float(entry["total_usd"])
+
+    def _attach_usage_cost(
+        self,
+        request: web.Request,
+        usage: dict[str, Any] | None,
+        *,
+        model_name: str,
+        provider: str | None = None,
+        raw: dict[str, Any] | None = None,
+        charge_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        normalized = normalize_responses_usage(usage)
+        if normalized is None:
+            return None
+        pricing = self._model_token_pricing(model_name=model_name, provider=provider, raw=raw)
+        if pricing is None:
+            normalized["request_cost_usd"] = None
+            normalized["task_cost_usd"] = None
+            normalized["cost_details"] = {
+                "estimated": False,
+                "currency": "USD",
+                "provider": provider or "",
+                "pricing_source": "unavailable",
+                "pricing_model": str((raw or {}).get("display_name") or model_name),
+                "reason": "pricing_unavailable",
+                "task_cost_scope": "session_id",
+            }
+            return normalized
+
+        input_tokens = int(normalized.get("input_tokens") or 0)
+        output_tokens = int(normalized.get("output_tokens") or 0)
+        input_cost_usd = input_tokens * float(pricing["input"]) / 1_000_000.0
+        output_cost_usd = output_tokens * float(pricing["output"]) / 1_000_000.0
+        request_cost_usd = input_cost_usd + output_cost_usd
+        task_cost_usd = self._record_session_cost(request, charge_key, request_cost_usd)
+
+        normalized["request_cost_usd"] = round(request_cost_usd, 6)
+        normalized["task_cost_usd"] = round(task_cost_usd, 6)
+        normalized["cost_details"] = {
+            "estimated": True,
+            "currency": "USD",
+            "provider": pricing.get("provider") or provider or "",
+            "pricing_source": pricing.get("source") or "unknown",
+            "pricing_model": pricing.get("label") or model_name,
+            "input_cost_usd": round(input_cost_usd, 6),
+            "output_cost_usd": round(output_cost_usd, 6),
+            "input_cost_per_million_tokens_usd": float(pricing["input"]),
+            "output_cost_per_million_tokens_usd": float(pricing["output"]),
+            "task_cost_scope": "session_id",
+        }
+        return normalized
+
+    def _attach_cost_to_responses_payload(
+        self,
+        request: web.Request,
+        payload: dict[str, Any],
+        *,
+        model_name: str,
+        provider: str | None = None,
+        raw: dict[str, Any] | None = None,
+        charge_key: str | None = None,
+    ) -> dict[str, Any]:
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            payload["usage"] = self._attach_usage_cost(
+                request,
+                usage,
+                model_name=model_name,
+                provider=provider,
+                raw=raw,
+                charge_key=charge_key or str(payload.get("id") or ""),
+            ) or usage
+            self._append_cost_summary_to_responses_payload(payload)
+        return payload
+
+    def _attach_cost_to_chat_payload(
+        self,
+        request: web.Request,
+        payload: dict[str, Any],
+        *,
+        model_name: str,
+        provider: str | None = None,
+        raw: dict[str, Any] | None = None,
+        charge_key: str | None = None,
+    ) -> dict[str, Any]:
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            return payload
+        normalized = self._attach_usage_cost(
+            request,
+            usage,
+            model_name=model_name,
+            provider=provider,
+            raw=raw,
+            charge_key=charge_key or str(payload.get("id") or ""),
+        )
+        if not isinstance(normalized, dict):
+            return payload
+        augmented = dict(usage)
+        augmented.setdefault("prompt_tokens", int(normalized.get("input_tokens") or 0))
+        augmented.setdefault("completion_tokens", int(normalized.get("output_tokens") or 0))
+        augmented.setdefault("total_tokens", int(normalized.get("total_tokens") or 0))
+        augmented["request_cost_usd"] = normalized.get("request_cost_usd")
+        augmented["task_cost_usd"] = normalized.get("task_cost_usd")
+        augmented["cost_details"] = normalized.get("cost_details")
+        payload["usage"] = augmented
+        self._append_cost_summary_to_chat_payload(payload)
+        return payload
+
+    def _attach_cost_to_anthropic_payload(
+        self,
+        request: web.Request,
+        payload: dict[str, Any],
+        *,
+        model_name: str,
+        provider: str | None = None,
+        raw: dict[str, Any] | None = None,
+        charge_key: str | None = None,
+    ) -> dict[str, Any]:
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            return payload
+        normalized = self._attach_usage_cost(
+            request,
+            usage,
+            model_name=model_name,
+            provider=provider,
+            raw=raw,
+            charge_key=charge_key or str(payload.get("id") or ""),
+        )
+        if not isinstance(normalized, dict):
+            return payload
+        augmented = dict(usage)
+        augmented.setdefault("input_tokens", int(normalized.get("input_tokens") or 0))
+        augmented.setdefault("output_tokens", int(normalized.get("output_tokens") or 0))
+        augmented["total_tokens"] = int(normalized.get("total_tokens") or 0)
+        augmented["request_cost_usd"] = normalized.get("request_cost_usd")
+        augmented["task_cost_usd"] = normalized.get("task_cost_usd")
+        augmented["cost_details"] = normalized.get("cost_details")
+        payload["usage"] = augmented
+        self._append_cost_summary_to_anthropic_payload(payload)
+        return payload
+
+    def _format_cost_summary_text(self, usage: dict[str, Any] | None) -> str | None:
+        if not isinstance(usage, dict):
+            return None
+        request_cost = usage.get("request_cost_usd")
+        task_cost = usage.get("task_cost_usd")
+
+        def _fmt(value: Any) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                return f"${float(value):.6f}"
+            except (TypeError, ValueError):
+                return "N/A"
+
+        return f"[Cost] Request: {_fmt(request_cost)} | Task total: {_fmt(task_cost)}"
+
+    def _append_cost_summary_to_text(self, text: str, usage: dict[str, Any] | None) -> str:
+        summary = self._format_cost_summary_text(usage)
+        if not summary:
+            return text
+        if summary in text:
+            return text
+        if text.rstrip():
+            return text.rstrip() + "\n\n" + summary
+        return summary
+
+    def _append_cost_summary_to_responses_payload(self, payload: dict[str, Any]) -> None:
+        usage = payload.get("usage")
+        output = payload.get("output")
+        if not isinstance(output, list):
+            return
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "output_text":
+                    continue
+                part["text"] = self._append_cost_summary_to_text(str(part.get("text") or ""), usage)
+                return
+
+    def _append_cost_summary_to_chat_payload(self, payload: dict[str, Any]) -> None:
+        usage = payload.get("usage")
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            return
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = self._append_cost_summary_to_text(content, usage)
+                return
+
+    def _append_cost_summary_to_anthropic_payload(self, payload: dict[str, Any]) -> None:
+        usage = payload.get("usage")
+        content = payload.get("content")
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            block["text"] = self._append_cost_summary_to_text(str(block.get("text") or ""), usage)
+            return
 
     async def _get_session(self) -> ClientSession:
         """Return a persistent ClientSession with connection pooling."""
@@ -612,6 +1061,9 @@ class ShimServer:
         if route.is_anthropic:
             forwarded = chat_to_anthropic(body, route.model, route.max_output_tokens)
             return await self._post_anthropic(request, route, forwarded, as_responses=False)
+        if route.is_bedrock:
+            forwarded = chat_to_anthropic(body, route.model, route.max_output_tokens)
+            return await self._post_bedrock(request, route, forwarded, as_responses=False)
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
     async def anthropic_messages(self, request: web.Request) -> web.StreamResponse:
@@ -660,6 +1112,25 @@ class ShimServer:
                             "requests will not switch models"
                         )
                     )
+            elif platform in BEDROCK_OPUS_PLATFORMS:
+                bedrock_model_id, bedrock_source_tag = BEDROCK_OPUS_PLATFORMS[platform]
+                route = self._route_bedrock_opus(bedrock_model_id)
+                if route is not None:
+                    forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
+                    claude_tool_count = _add_claude_execution_guidance_anthropic(forwarded, body)
+                    if claude_tool_count >= CLAUDE_LOOP_BREAK_TOOL_THRESHOLD:
+                        print(
+                            f"[shim] Claude loop breaker injected after {claude_tool_count} tool calls",
+                            flush=True,
+                        )
+                    return await self._post_bedrock(
+                        request, route, forwarded, as_responses=True,
+                        source_tag=bedrock_source_tag,
+                    )
+                else:
+                    raise web.HTTPServiceUnavailable(
+                        text=f"No Bedrock model configured for [{platform}]; add it to models.json with provider=bedrock"
+                    )
             elif platform == "chatgpt":
                 if chatgpt_passthrough_available():
                     model = str(body.get("model") or CHATGPT_MODEL_SLUG)
@@ -695,7 +1166,22 @@ class ShimServer:
                 return await self._post_openai_chat(request, route, forwarded, as_responses=True)
             if route.is_anthropic:
                 forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
+                claude_tool_count = _add_claude_execution_guidance_anthropic(forwarded, body)
+                if claude_tool_count >= CLAUDE_LOOP_BREAK_TOOL_THRESHOLD:
+                    print(
+                        f"[shim] Claude loop breaker injected after {claude_tool_count} tool calls",
+                        flush=True,
+                    )
                 return await self._post_anthropic(request, route, forwarded, as_responses=True)
+            if route.is_bedrock:
+                forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
+                claude_tool_count = _add_claude_execution_guidance_anthropic(forwarded, body)
+                if claude_tool_count >= CLAUDE_LOOP_BREAK_TOOL_THRESHOLD:
+                    print(
+                        f"[shim] Claude loop breaker injected after {claude_tool_count} tool calls",
+                        flush=True,
+                    )
+                return await self._post_bedrock(request, route, forwarded, as_responses=True)
             raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
         # Claude/Kiro is the default platform. A ChatGPT model slug selected
@@ -726,6 +1212,34 @@ class ShimServer:
             return await self._chatgpt_compact_passthrough(request, body, upstream_model=upstream)
         if platform == "chatgpt":
             print("[shim] ChatGPT compact unavailable; using default Claude gateway", flush=True)
+        elif platform in BEDROCK_OPUS_PLATFORMS:
+            bedrock_model_id, bedrock_source_tag = BEDROCK_OPUS_PLATFORMS[platform]
+            route = self._route_bedrock_opus(bedrock_model_id)
+            if route is not None:
+                compact_body = _compact_request_body(body, route.model)
+                forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
+                _add_claude_execution_guidance_anthropic(forwarded, compact_body)
+                forwarded["stream"] = False
+                response = await self._post_bedrock(
+                    request, route, forwarded, as_responses=True,
+                    source_tag=bedrock_source_tag,
+                )
+                return await _as_compact_response(
+                    response,
+                    route.slug,
+                    usage_transform=lambda usage, charge_key: self._attach_usage_cost(
+                        request,
+                        usage,
+                        model_name=route.model,
+                        provider=route.provider,
+                        raw=route.raw,
+                        charge_key=charge_key,
+                    ) or usage,
+                )
+            else:
+                raise web.HTTPServiceUnavailable(
+                    text=f"No Bedrock model configured for [{platform}]; add it to models.json with provider=bedrock"
+                )
         model = str(body.get("model") or "")
         if not is_chatgpt_passthrough_slug(model):
             if is_cursor_passthrough_slug(model):
@@ -748,12 +1262,52 @@ class ShimServer:
                 forwarded = responses_to_chat(compact_body, route.model)
                 forwarded["stream"] = False
                 response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
-                return await _as_compact_response(response, route.slug)
+                return await _as_compact_response(
+                    response,
+                    route.slug,
+                    usage_transform=lambda usage, charge_key: self._attach_usage_cost(
+                        request,
+                        usage,
+                        model_name=route.model,
+                        provider=route.provider,
+                        raw=route.raw,
+                        charge_key=charge_key,
+                    ) or usage,
+                )
             if route.is_anthropic:
                 forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
+                _add_claude_execution_guidance_anthropic(forwarded, compact_body)
                 forwarded["stream"] = False
                 response = await self._post_anthropic(request, route, forwarded, as_responses=True)
-                return await _as_compact_response(response, route.slug)
+                return await _as_compact_response(
+                    response,
+                    route.slug,
+                    usage_transform=lambda usage, charge_key: self._attach_usage_cost(
+                        request,
+                        usage,
+                        model_name=route.model,
+                        provider=route.provider,
+                        raw=route.raw,
+                        charge_key=charge_key,
+                    ) or usage,
+                )
+            if route.is_bedrock:
+                forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
+                _add_claude_execution_guidance_anthropic(forwarded, compact_body)
+                forwarded["stream"] = False
+                response = await self._post_bedrock(request, route, forwarded, as_responses=True)
+                return await _as_compact_response(
+                    response,
+                    route.slug,
+                    usage_transform=lambda usage, charge_key: self._attach_usage_cost(
+                        request,
+                        usage,
+                        model_name=route.model,
+                        provider=route.provider,
+                        raw=route.raw,
+                        charge_key=charge_key,
+                    ) or usage,
+                )
             raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
         return await self._claude_gateway_compact(body)
 
@@ -1142,6 +1696,13 @@ class ShimServer:
         if not forwarded.get("stream"):
             payload = await upstream.json(content_type=None)
             _rewrite_response_model(payload, response_model_override)
+            if isinstance(payload, dict):
+                payload = self._attach_cost_to_responses_payload(
+                    request,
+                    payload,
+                    model_name=str(payload.get("model") or response_model_override or original_model or ""),
+                    provider="chatgpt",
+                )
             return web.json_response(payload)
 
         # --- In-stream error detection: buffer early data before committing ---
@@ -1867,7 +2428,17 @@ class ShimServer:
             model_name = "deepseek-pro" if use_pro else "deepseek"
             tool_types = _build_tool_types(body)
             tool_schemas = self._deepseek_tool_schemas(body)
-            state = ResponsesStreamState(model_name, tool_types)
+            state = ResponsesStreamState(
+                model_name,
+                tool_types,
+                usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
+                    request,
+                    usage,
+                    model_name=model_name,
+                    provider="deepseek",
+                    charge_key=charge_key,
+                ) or usage,
+            )
 
             chunk_count = 0
             source_injected = False
@@ -2106,6 +2677,13 @@ class ShimServer:
                 payload = await upstream.json()
             except Exception:
                 payload = json.loads(await upstream.text())
+            if isinstance(payload, dict):
+                payload = self._attach_cost_to_responses_payload(
+                    request,
+                    payload,
+                    model_name=ds_model,
+                    provider="deepseek",
+                )
             return web.json_response(payload)
 
         downstream = web.StreamResponse(
@@ -2204,7 +2782,17 @@ class ShimServer:
 
         model_name = response_model_override or DEFAULT_CLAUDE_GATEWAY_MODEL
         tool_types = _build_tool_types(body)
-        state = ResponsesStreamState(model_name, tool_types)
+        state = ResponsesStreamState(
+            model_name,
+            tool_types,
+            usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
+                request,
+                usage,
+                model_name=model_name,
+                provider="claude-gateway",
+                charge_key=charge_key,
+            ) or usage,
+        )
 
         chunk_count = 0
         source_injected = False
@@ -2344,7 +2932,17 @@ class ShimServer:
 
         model_name = response_model_override or "gpt-5.6-sol"
         tool_types = _build_tool_types(body)
-        state = ResponsesStreamState(model_name, tool_types)
+        state = ResponsesStreamState(
+            model_name,
+            tool_types,
+            usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
+                request,
+                usage,
+                model_name=model_name,
+                provider="openai-api",
+                charge_key=charge_key,
+            ) or usage,
+        )
 
         chunk_count = 0
         source_injected = False
@@ -2503,6 +3101,13 @@ class ShimServer:
 
         payload = await upstream.json(content_type=None)
         _rewrite_response_model(payload, original_model or None)
+        if isinstance(payload, dict):
+            payload = self._attach_cost_to_responses_payload(
+                request,
+                payload,
+                model_name=str(payload.get("model") or original_model or ""),
+                provider="chatgpt",
+            )
         return web.json_response(payload)
 
     async def _cursor_passthrough(
@@ -2551,12 +3156,29 @@ class ShimServer:
             normalized_usage = normalize_responses_usage(usage)
             if normalized_usage:
                 payload["usage"] = normalized_usage
+                payload = self._attach_cost_to_responses_payload(
+                    request,
+                    payload,
+                    model_name=slug,
+                    provider="cursor-subscription",
+                    charge_key=str(payload.get("id") or ""),
+                )
             return web.json_response(payload)
 
         response = _sse_response()
         await response.prepare(request)
         tool_types = _build_tool_types(body)
-        state = ResponsesStreamState(slug, tool_types)
+        state = ResponsesStreamState(
+            slug,
+            tool_types,
+            usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
+                request,
+                usage,
+                model_name=slug,
+                provider="cursor-subscription",
+                charge_key=charge_key,
+            ) or usage,
+        )
         try:
             await state.start(response)
             async for event in iter_cursor_agent_events(prompt, upstream):
@@ -2698,8 +3320,24 @@ class ShimServer:
         if as_responses:
             tool_types = _build_tool_types(body)
             payload = chat_completion_to_response(payload, route.slug, tool_types)
+            if isinstance(payload, dict):
+                payload = self._attach_cost_to_responses_payload(
+                    request,
+                    payload,
+                    model_name=route.model,
+                    provider=route.provider,
+                    raw=route.raw,
+                )
             intercepted = _maybe_intercept_web_search(payload)
             return web.json_response(intercepted or payload)
+        if isinstance(payload, dict):
+            payload = self._attach_cost_to_chat_payload(
+                request,
+                payload,
+                model_name=route.model,
+                provider=route.provider,
+                raw=route.raw,
+            )
         return web.json_response(payload)
 
     async def _post_openai_chat_as_anthropic(
@@ -2715,7 +3353,16 @@ class ShimServer:
             if body.get("stream"):
                 return await self._stream_openai_chat_as_anthropic(request, upstream, route)
             payload = await upstream.json(content_type=None)
-        return web.json_response(chat_completion_to_anthropic_message(payload, route.slug))
+        converted = chat_completion_to_anthropic_message(payload, route.slug)
+        if isinstance(converted, dict):
+            converted = self._attach_cost_to_anthropic_payload(
+                request,
+                converted,
+                model_name=route.model,
+                provider=route.provider,
+                raw=route.raw,
+            )
+        return web.json_response(converted)
 
     async def _post_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool
@@ -2732,9 +3379,329 @@ class ShimServer:
         if as_responses:
             tool_types = _build_tool_types(body)
             payload = anthropic_to_response(payload, route.slug, tool_types)
+            payload = self._attach_cost_to_responses_payload(
+                request,
+                payload,
+                model_name=route.model,
+                provider=route.provider,
+                raw=route.raw,
+                charge_key=str(payload.get("id") or ""),
+            )
             intercepted = _maybe_intercept_web_search(payload)
             return web.json_response(intercepted or payload)
-        return web.json_response(anthropic_to_chat_response(payload, route.slug))
+        converted = anthropic_to_chat_response(payload, route.slug)
+        if isinstance(converted, dict):
+            converted = self._attach_cost_to_chat_payload(
+                request,
+                converted,
+                model_name=route.model,
+                provider=route.provider,
+                raw=route.raw,
+            )
+        return web.json_response(converted)
+
+    @staticmethod
+    def _bedrock_chunks_to_anthropic_message(chunks: list, model: str) -> dict:
+        """Reassemble Bedrock streaming chunks into a single Anthropic message dict."""
+        import json as _json
+        content: list = []
+        stop_reason = "end_turn"
+        usage: dict = {}
+        for chunk in chunks:
+            ctype = chunk.get("type")
+            if ctype == "message_start":
+                msg = chunk.get("message") or {}
+                usage = dict(msg.get("usage") or {})
+                model = msg.get("model") or model
+            elif ctype == "content_block_start":
+                block = dict(chunk.get("content_block") or {})
+                content.append(block)
+            elif ctype == "content_block_delta":
+                idx = chunk.get("index", 0)
+                delta = chunk.get("delta") or {}
+                if idx < len(content):
+                    dtype = delta.get("type")
+                    if dtype == "text_delta":
+                        content[idx]["text"] = content[idx].get("text", "") + delta.get("text", "")
+                    elif dtype == "thinking_delta":
+                        content[idx]["thinking"] = content[idx].get("thinking", "") + delta.get("thinking", "")
+                    elif dtype == "signature_delta":
+                        content[idx]["signature"] = content[idx].get("signature", "") + delta.get("signature", "")
+                    elif dtype == "input_json_delta":
+                        content[idx]["_raw_input"] = content[idx].get("_raw_input", "") + delta.get("partial_json", "")
+            elif ctype == "content_block_stop":
+                idx = chunk.get("index", 0)
+                if idx < len(content) and "_raw_input" in content[idx]:
+                    try:
+                        content[idx]["input"] = _json.loads(content[idx].pop("_raw_input"))
+                    except Exception:
+                        content[idx]["input"] = {}
+            elif ctype == "message_delta":
+                d = chunk.get("delta") or {}
+                stop_reason = d.get("stop_reason") or stop_reason
+                u = chunk.get("usage") or {}
+                usage.update(u)
+        return {
+            "id": f"msg_bedrock_{int(time.time() * 1000)}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+            "usage": usage,
+        }
+
+    def _route_bedrock_opus(self, model_id: str) -> "ShimModel | None":
+        """Find a configured Bedrock ShimModel matching model_id.
+
+        Falls back to the first available bedrock model if no exact match.
+        """
+        models = self.settings.load()
+        bedrock = [m for m in models if m.is_bedrock]
+        exact = next((m for m in bedrock if m.model == model_id), None)
+        if exact:
+            return exact
+        # Accept prefix match: us.anthropic.claude-opus-4-8 matches claude-opus-4-8
+        suffix = model_id.split(".")[-1] if "." in model_id else model_id
+        partial = next((m for m in bedrock if suffix in m.model), None)
+        return partial or (bedrock[0] if bedrock else None)
+
+    @staticmethod
+    def _sanitize_bedrock_messages(messages: Any) -> Any:
+        """Drop replayed thinking blocks/signatures for Bedrock.
+
+        Bedrock validates historical thinking blocks more strictly than the
+        direct Anthropic API and rejects replayed signatures from prior turns.
+        Preserve regular text + tool flow, but strip thinking-only blocks.
+
+        Additional rules:
+        - If an assistant message becomes empty (was thinking-only), drop it.
+        - Merge consecutive user messages left by dropped assistant turns.
+        - Strip empty-string signature fields Bedrock rejects even on kept blocks.
+        """
+        if not isinstance(messages, list):
+            return messages
+
+        sanitized_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            cloned = dict(msg)
+            content = cloned.get("content")
+            if isinstance(content, list):
+                filtered: list[Any] = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        filtered.append(block)
+                        continue
+                    btype = block.get("type")
+                    if btype in {"thinking", "redacted_thinking"}:
+                        continue
+                    # Some models emit a signature field on text blocks that
+                    # Bedrock rejects; remove it defensively.
+                    if "signature" in block:
+                        block = {k: v for k, v in block.items() if k != "signature"}
+                    filtered.append(block)
+                # Drop the message entirely if content is now empty and role is
+                # assistant (was a thinking-only turn).
+                if not filtered and cloned.get("role") == "assistant":
+                    continue
+                cloned["content"] = filtered
+            sanitized_messages.append(cloned)
+
+        # Merge consecutive same-role messages that may appear after dropping
+        # thinking-only assistant turns (e.g. user … user).
+        merged: list[dict[str, Any]] = []
+        for msg in sanitized_messages:
+            if (
+                merged
+                and merged[-1].get("role") == msg.get("role")
+                and isinstance(merged[-1].get("content"), list)
+                and isinstance(msg.get("content"), list)
+            ):
+                merged[-1]["content"].extend(msg["content"])
+            else:
+                merged.append(msg)
+        return merged
+
+    async def _post_bedrock(
+        self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
+        source_tag: str | None = None,
+    ) -> web.StreamResponse:
+        """Invoke an AWS Bedrock model using boto3 with the Anthropic Messages API.
+
+        Bedrock returns standard Anthropic event chunks which are fed directly
+        into ResponsesStreamState.write_anthropic_delta (streaming) or
+        reassembled into an Anthropic message dict (non-streaming).
+        """
+        try:
+            import boto3  # type: ignore
+        except ImportError:
+            raise web.HTTPBadGateway(
+                text="boto3 is required for the bedrock provider; run: pip install boto3"
+            )
+
+        aws_profile = bedrock_aws_profile(route.raw)
+        aws_region = bedrock_aws_region(route.raw)
+
+        def _invoke() -> list:
+            import json as _json
+            session = boto3.Session(profile_name=aws_profile or None)
+            from botocore.config import Config as _BotocoreConfig
+            client = session.client(
+                "bedrock-runtime",
+                region_name=aws_region,
+                config=_BotocoreConfig(read_timeout=600, connect_timeout=30),
+            )
+            bedrock_body = {k: v for k, v in body.items() if k != "stream"}
+            # Bedrock selects the model via modelId, so the Anthropic Messages
+            # body must not repeat a top-level `model` field.
+            bedrock_body.pop("model", None)
+            bedrock_body.setdefault("anthropic_version", "bedrock-2023-05-31")
+            # Bedrock does not support assistant message prefill: the
+            # conversation must end with a user message. Strip any trailing
+            # assistant turns that Codex appends from the previous turn.
+            msgs = bedrock_body.get("messages")
+            if isinstance(msgs, list):
+                while msgs and isinstance(msgs[-1], dict) and msgs[-1].get("role") == "assistant":
+                    msgs = msgs[:-1]
+                bedrock_body["messages"] = self._sanitize_bedrock_messages(msgs)
+            response = client.invoke_model_with_response_stream(
+                modelId=route.model,
+                body=_json.dumps(bedrock_body),
+                contentType="application/json",
+                accept="application/json",
+            )
+            chunks = []
+            chunk_type_counts: dict[str, int] = {}
+            for event in response["body"]:
+                raw = event.get("chunk", {}).get("bytes", b"")
+                if raw:
+                    try:
+                        parsed = _json.loads(raw)
+                        chunks.append(parsed)
+                        ctype = str(parsed.get("type") or "unknown")
+                        chunk_type_counts[ctype] = chunk_type_counts.get(ctype, 0) + 1
+                    except Exception:
+                        pass
+            print(
+                "[shim] Bedrock stream collected"
+                f" model={route.model} chunks={len(chunks)} types={chunk_type_counts}",
+                flush=True,
+            )
+            return chunks
+
+        loop = asyncio.get_event_loop()
+        model_name = route.slug
+        tool_types = _build_tool_types(body)
+        print(
+            "[shim] Bedrock request start"
+            f" model={route.model} stream={bool(body.get('stream'))}"
+            f" as_responses={as_responses} tools={len(tool_types)}",
+            flush=True,
+        )
+
+        if body.get("stream"):
+            response = _sse_response()
+            await response.prepare(request)
+            state = ResponsesStreamState(
+                model_name,
+                tool_types,
+                usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
+                    request,
+                    usage,
+                    model_name=route.model,
+                    provider=route.provider,
+                    raw=route.raw,
+                    charge_key=charge_key,
+                ) or usage,
+            )
+            try:
+                await state.start(response)
+                await _safe_write(response, b": codex-shim connected\n\n")
+                started_at = time.monotonic()
+                chunks = await _await_with_sse_heartbeats(
+                    loop.run_in_executor(None, _invoke),
+                    response,
+                    timeout=60 * 15,
+                    interval=1.0,
+                )
+                print(
+                    "[shim] Bedrock stream replay start"
+                    f" model={route.model} chunks={len(chunks)}"
+                    f" wait_s={time.monotonic() - started_at:.2f}",
+                    flush=True,
+                )
+                source_injected = False
+                first_text_delta_emitted = False
+                for chunk in chunks:
+                    if (
+                        source_tag
+                        and not source_injected
+                        and chunk.get("type") == "content_block_delta"
+                        and (chunk.get("delta") or {}).get("type") == "text_delta"
+                    ):
+                        # Prepend source tag to first text fragment
+                        patched = dict(chunk)
+                        patched["delta"] = dict(chunk["delta"])
+                        patched["delta"]["text"] = source_tag + " " + patched["delta"]["text"]
+                        chunk = patched
+                        source_injected = True
+                    if (
+                        not first_text_delta_emitted
+                        and chunk.get("type") == "content_block_delta"
+                        and (chunk.get("delta") or {}).get("type") == "text_delta"
+                    ):
+                        first_text_delta_emitted = True
+                        print(
+                            f"[shim] Bedrock first text delta model={route.model}",
+                            flush=True,
+                        )
+                    await state.write_anthropic_delta(response, chunk)
+                await state.finish(response)
+                print(
+                    "[shim] Bedrock stream completed"
+                    f" model={route.model} first_text_delta={first_text_delta_emitted}",
+                    flush=True,
+                )
+            except ClientDisconnected:
+                pass
+            except Exception as exc:
+                print(f"[shim] Bedrock stream failed model={route.model}: {exc}", flush=True)
+                raise web.HTTPBadGateway(text=f"Bedrock invocation failed: {exc}")
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+            return response
+
+        try:
+            chunks = await loop.run_in_executor(None, _invoke)
+        except Exception as exc:
+            print(f"[shim] Bedrock non-stream failed model={route.model}: {exc}", flush=True)
+            raise web.HTTPBadGateway(text=f"Bedrock invocation failed: {exc}")
+
+        # Non-streaming: reassemble and convert
+        payload = self._bedrock_chunks_to_anthropic_message(chunks, route.model)
+        if source_tag:
+            for block in payload.get("content", []):
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    if not block["text"].startswith(source_tag):
+                        block["text"] = source_tag + " " + block["text"]
+                    break
+        if as_responses:
+            payload = anthropic_to_response(payload, model_name, tool_types)
+            payload = self._attach_cost_to_responses_payload(
+                request,
+                payload,
+                model_name=route.model,
+                provider=route.provider,
+                raw=route.raw,
+                charge_key=str(payload.get("id") or ""),
+            )
+            return web.json_response(payload)
+        return web.json_response(anthropic_to_chat_response(payload, model_name))
 
     async def _post_anthropic_messages(
         self, request: web.Request, route: ShimModel, body: dict[str, Any]
@@ -2746,10 +3713,24 @@ class ShimServer:
             if upstream.status >= 400:
                 return await _error_response(upstream, slug=route.slug)
             if body.get("stream"):
-                return await self._stream_raw_sse(request, upstream, route.slug)
+                return await self._stream_raw_sse(
+                    request,
+                    upstream,
+                    route.slug,
+                    model_name=route.model,
+                    provider=route.provider,
+                    raw=route.raw,
+                )
             payload = await upstream.json(content_type=None)
         if isinstance(payload, dict):
             payload["model"] = route.slug
+            payload = self._attach_cost_to_anthropic_payload(
+                request,
+                payload,
+                model_name=route.model,
+                provider=route.provider,
+                raw=route.raw,
+            )
         return web.json_response(payload)
 
     async def _stream_openai_chat(
@@ -2757,9 +3738,21 @@ class ShimServer:
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
+        stream_usage: dict[str, Any] | None = None
         if as_responses:
             tool_types = _build_tool_types(body) if body else {}
-            state = ResponsesStreamState(route.slug, tool_types)
+            state = ResponsesStreamState(
+                route.slug,
+                tool_types,
+                usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
+                    request,
+                    usage,
+                    model_name=route.model,
+                    provider=route.provider,
+                    raw=route.raw,
+                    charge_key=charge_key,
+                ) or usage,
+            )
         try:
             if as_responses:
                 await state.start(response)
@@ -2773,10 +3766,32 @@ class ShimServer:
                 if as_responses:
                     await state.write_chat_delta(response, event)
                 else:
+                    usage = event.get("usage")
+                    if isinstance(usage, dict):
+                        stream_usage = usage
                     await _write_sse(response, event)
             if as_responses:
                 await state.finish(response)
             else:
+                if isinstance(stream_usage, dict):
+                    payload = {"id": f"chatcmpl_cost_{int(time.time() * 1000)}", "usage": stream_usage}
+                    payload = self._attach_cost_to_chat_payload(
+                        request,
+                        payload,
+                        model_name=route.model,
+                        provider=route.provider,
+                        raw=route.raw,
+                    )
+                    await _write_sse(
+                        response,
+                        {
+                            "id": payload["id"],
+                            "object": "chat.completion.chunk",
+                            "model": route.slug,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                            "usage": payload.get("usage"),
+                        },
+                    )
                 await _safe_write(response, b"data: [DONE]\n\n")
         except ClientDisconnected:
             pass
@@ -2793,7 +3808,17 @@ class ShimServer:
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
-        state = AnthropicMessagesStreamState(route.slug)
+        state = AnthropicMessagesStreamState(
+            route.slug,
+            usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
+                request,
+                usage,
+                model_name=route.model,
+                provider=route.provider,
+                raw=route.raw,
+                charge_key=charge_key,
+            ) or usage,
+        )
         try:
             await state.start(response)
             async for line in _sse_lines(upstream):
@@ -2820,9 +3845,21 @@ class ShimServer:
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
+        stream_usage: dict[str, Any] | None = None
         if as_responses:
             tool_types = _build_tool_types(body) if body else {}
-            state = ResponsesStreamState(route.slug, tool_types)
+            state = ResponsesStreamState(
+                route.slug,
+                tool_types,
+                usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
+                    request,
+                    usage,
+                    model_name=route.model,
+                    provider=route.provider,
+                    raw=route.raw,
+                    charge_key=charge_key,
+                ) or usage,
+            )
         try:
             if as_responses:
                 await state.start(response)
@@ -2836,10 +3873,35 @@ class ShimServer:
                 if as_responses:
                     await state.write_anthropic_delta(response, event)
                 else:
+                    usage = event.get("usage")
+                    if isinstance(usage, dict):
+                        if stream_usage is None:
+                            stream_usage = dict(usage)
+                        else:
+                            stream_usage.update(usage)
                     await _write_sse(response, _anthropic_stream_to_chat_chunk(event, route.slug))
             if as_responses:
                 await state.finish(response)
             else:
+                if isinstance(stream_usage, dict):
+                    payload = {"id": f"chatcmpl_cost_{int(time.time() * 1000)}", "usage": stream_usage}
+                    payload = self._attach_cost_to_chat_payload(
+                        request,
+                        payload,
+                        model_name=route.model,
+                        provider=route.provider,
+                        raw=route.raw,
+                    )
+                    await _write_sse(
+                        response,
+                        {
+                            "id": payload["id"],
+                            "object": "chat.completion.chunk",
+                            "model": route.slug,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                            "usage": payload.get("usage"),
+                        },
+                    )
                 await _safe_write(response, b"data: [DONE]\n\n")
         except ClientDisconnected:
             pass
@@ -2851,7 +3913,16 @@ class ShimServer:
             pass
         return response
 
-    async def _stream_raw_sse(self, request: web.Request, upstream, model_slug: str | None = None) -> web.StreamResponse:
+    async def _stream_raw_sse(
+        self,
+        request: web.Request,
+        upstream,
+        model_slug: str | None = None,
+        *,
+        model_name: str | None = None,
+        provider: str | None = None,
+        raw: dict[str, Any] | None = None,
+    ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
         try:
@@ -2863,6 +3934,28 @@ class ShimServer:
                             msg = event.get("message")
                             if isinstance(msg, dict):
                                 msg["model"] = model_slug
+                        elif (
+                            isinstance(event, dict)
+                            and event.get("type") == "message_delta"
+                            and isinstance(event.get("usage"), dict)
+                        ):
+                            attached = self._attach_usage_cost(
+                                request,
+                                event.get("usage"),
+                                model_name=model_name or model_slug or "",
+                                provider=provider,
+                                raw=raw,
+                                charge_key=f"{model_slug or 'raw'}:{event.get('type')}",
+                            )
+                            if isinstance(attached, dict):
+                                event["usage"] = {
+                                    **dict(event.get("usage") or {}),
+                                    **{
+                                        key: attached[key]
+                                        for key in ("request_cost_usd", "task_cost_usd", "cost_details", "total_tokens")
+                                        if key in attached
+                                    },
+                                }
                         await _write_anthropic_sse(response, event.get("type", "message"), event)
                         continue
                     except json.JSONDecodeError:
@@ -2919,13 +4012,27 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
     """
     import re
     prefix_pattern = re.compile(
-        r'^\s*\[(deepseek-pro|deepseek|chatgpt|claude|claud|kiro)\]\s*',
+        r'^\s*\[(deepseek-pro|deepseek|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro)\]\s*',
         re.IGNORECASE,
     )
 
     def normalize_platform(value: str) -> str:
         platform = value.lower()
-        return "claude" if platform in {"claud", "kiro"} else platform
+        # keep claude-opus-X variants as-is; normalize aliases
+        if platform in {"claud", "kiro"}:
+            return "claude"
+        return platform
+
+    def strip_all_leading_prefixes(text: str) -> tuple[str, str | None]:
+        platform: str | None = None
+        current = text
+        while True:
+            match = prefix_pattern.match(current)
+            if not match:
+                return current.lstrip(), platform
+            if platform is None:
+                platform = normalize_platform(match.group(1))
+            current = current[match.end():]
 
     input_data = body.get("input")
     if not input_data:
@@ -2933,11 +4040,10 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
 
     # Handle string input
     if isinstance(input_data, str):
-        match = prefix_pattern.match(input_data)
-        if match:
-            platform = normalize_platform(match.group(1))
+        stripped, platform = strip_all_leading_prefixes(input_data)
+        if platform:
             new_body = dict(body)
-            new_body["input"] = input_data[match.end():].lstrip()
+            new_body["input"] = stripped
             return new_body, platform
         return body, None
 
@@ -2954,13 +4060,12 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
             content = item.get("content")
             # Handle string content
             if isinstance(content, str):
-                match = prefix_pattern.match(content)
-                if match:
-                    platform = normalize_platform(match.group(1))
+                stripped, platform = strip_all_leading_prefixes(content)
+                if platform:
                     new_body = dict(body)
                     new_input = list(input_data)
                     new_item = dict(item)
-                    new_item["content"] = content[match.end():].lstrip()
+                    new_item["content"] = stripped
                     new_input[i] = new_item
                     new_body["input"] = new_input
                     return new_body, platform
@@ -2973,16 +4078,15 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
                     text = part.get("text") or part.get("input_text")
                     if not text:
                         continue
-                    match = prefix_pattern.match(text)
-                    if match:
-                        platform = normalize_platform(match.group(1))
+                    stripped, platform = strip_all_leading_prefixes(str(text))
+                    if platform:
                         new_body = dict(body)
                         new_input = list(input_data)
                         new_item = dict(item)
                         new_content = list(content)
                         new_part = dict(part)
                         text_key = "text" if "text" in part else "input_text"
-                        new_part[text_key] = text[match.end():].lstrip()
+                        new_part[text_key] = stripped
                         new_content[j] = new_part
                         new_item["content"] = new_content
                         new_input[i] = new_item
@@ -3541,7 +4645,7 @@ def _rewrite_response_model(payload: Any, model: str | None) -> None:
 class AnthropicMessagesStreamState:
     """Translates OpenAI chat-completions chunks into Anthropic Messages SSE."""
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, usage_finalizer: Any = None):
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.model = model
         self.next_index = 0
@@ -3552,6 +4656,8 @@ class AnthropicMessagesStreamState:
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.usage: dict[str, Any] | None = None
         self.stop_reason = "end_turn"
+        self.usage_finalizer = usage_finalizer
+        self._usage_finalized = False
 
     async def start(self, response: web.StreamResponse) -> None:
         await _write_anthropic_sse(
@@ -3601,13 +4707,26 @@ class AnthropicMessagesStreamState:
             state = self.tool_calls[index]
             if not state.get("closed"):
                 await self._close_tool(response, index, state)
+        if not self._usage_finalized:
+            if self.usage is None:
+                self.usage = {"input_tokens": 0, "output_tokens": 0}
+            if callable(self.usage_finalizer):
+                finalized = self.usage_finalizer(self.usage, self.message_id)
+                if isinstance(finalized, dict):
+                    self.usage = finalized
+            self._usage_finalized = True
+        delta_usage = _responses_usage_to_anthropic_usage(self.usage) or {"output_tokens": 0}
+        if isinstance(self.usage, dict):
+            for key in ("request_cost_usd", "task_cost_usd", "cost_details", "total_tokens"):
+                if key in self.usage:
+                    delta_usage[key] = self.usage[key]
         await _write_anthropic_sse(
             response,
             "message_delta",
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
-                "usage": _responses_usage_to_anthropic_usage(self.usage) or {"output_tokens": 0},
+                "usage": delta_usage,
             },
         )
         await _write_anthropic_sse(response, "message_stop", {"type": "message_stop"})
@@ -3762,7 +4881,12 @@ class ResponsesStreamState:
     proper .added / .delta / .done / .completed events plus a final
     `response.completed` with the full reconciled `output` array."""
 
-    def __init__(self, model: str, tool_types: dict[str, str] | None = None):
+    def __init__(
+        self,
+        model: str,
+        tool_types: dict[str, str] | None = None,
+        usage_finalizer: Any = None,
+    ):
         self.response_id = f"resp_{int(time.time() * 1000)}"
         self.message_item_id = f"msg_{int(time.time() * 1000)}"
         self.model = model
@@ -3778,6 +4902,8 @@ class ResponsesStreamState:
         # emit the correct output item type (e.g. custom_tool_call for freeform
         # apply_patch instead of generic function_call).
         self.tool_types = tool_types or {}
+        self.usage_finalizer = usage_finalizer
+        self._usage_finalized = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -3789,6 +4915,35 @@ class ResponsesStreamState:
         for state in sorted(self.reasoning_blocks.values(), key=lambda s: s["output_index"]):
             if not state.get("closed"):
                 await self._close_reasoning(response, state)
+        if not self._usage_finalized:
+            if self.usage is None:
+                self.usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            if callable(self.usage_finalizer):
+                finalized = self.usage_finalizer(self.usage, self.response_id)
+                if isinstance(finalized, dict):
+                    self.usage = finalized
+            self._usage_finalized = True
+        summary = self._format_cost_summary_text()
+        if summary and self.message_opened and summary not in self.message_text:
+            if not self.message_closed:
+                delta = ("\n\n" if self.message_text.rstrip() else "") + summary
+                self.message_text += delta
+                await _write_sse(
+                    response,
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": self.message_item_id,
+                        "output_index": self.message_index,
+                        "content_index": 0,
+                        "delta": delta,
+                    },
+                )
+            else:
+                self.message_text = (
+                    self.message_text.rstrip() + "\n\n" + summary
+                    if self.message_text.rstrip()
+                    else summary
+                )
         if self.message_opened and not self.message_closed:
             await self._close_message(response)
         for state in sorted(self.tool_calls.values(), key=lambda s: s["output_index"]):
@@ -4241,6 +5396,22 @@ class ResponsesStreamState:
                 {"type": "output_text", "text": self.message_text, "annotations": []}
             ] if self.message_text else [],
         }
+
+    def _format_cost_summary_text(self) -> str | None:
+        if not isinstance(self.usage, dict):
+            return None
+        request_cost = self.usage.get("request_cost_usd")
+        task_cost = self.usage.get("task_cost_usd")
+
+        def _fmt(value: Any) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                return f"${float(value):.6f}"
+            except (TypeError, ValueError):
+                return "N/A"
+
+        return f"[Cost] Request: {_fmt(request_cost)} | Task total: {_fmt(task_cost)}"
 
     def _tool_item(self, state: dict[str, Any], status: str) -> dict[str, Any]:
         item = {
@@ -4854,7 +6025,11 @@ def _default_compact_instructions() -> str:
     )
 
 
-async def _as_compact_response(response: web.StreamResponse, model: str) -> web.Response:
+async def _as_compact_response(
+    response: web.StreamResponse,
+    model: str,
+    usage_transform: Any = None,
+) -> web.Response:
     if not isinstance(response, web.Response) or response.status >= 400:
         return response
     try:
@@ -4862,8 +6037,12 @@ async def _as_compact_response(response: web.StreamResponse, model: str) -> web.
     except json.JSONDecodeError:
         return response
     output = payload.get("output") if isinstance(payload, dict) else None
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    charge_key = str(payload.get("id") or "") if isinstance(payload, dict) else ""
+    if isinstance(usage, dict) and callable(usage_transform):
+        usage = usage_transform(usage, charge_key)
     summary = _compact_summary_from_output(output)
-    compacted = _compact_response_payload(model, summary, payload.get("usage") if isinstance(payload, dict) else None)
+    compacted = _compact_response_payload(model, summary, usage)
     return web.json_response(compacted)
 
 

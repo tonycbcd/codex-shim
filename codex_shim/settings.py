@@ -203,6 +203,10 @@ class ShimModel:
         return self.provider == "anthropic"
 
     @property
+    def is_bedrock(self) -> bool:
+        return self.provider == "bedrock"
+
+    @property
     def is_openai_chat(self) -> bool:
         return self.provider in {"openai", "generic-chat-completion-api"}
 
@@ -406,4 +410,25 @@ def available_model_slugs(models: list[ShimModel]) -> set[str]:
 
 
 def byok_model_has_credentials(model: ShimModel) -> bool:
+    if model.provider == "bedrock":
+        # Bedrock uses AWS credentials from the profile; no api_key required
+        return True
     return bool(model.api_key.strip())
+
+
+def bedrock_aws_profile(model_raw: dict) -> str:
+    """Extract aws_profile from raw model config."""
+    return str(
+        model_raw.get("aws_profile")
+        or model_raw.get("awsProfile")
+        or ""
+    ).strip()
+
+
+def bedrock_aws_region(model_raw: dict) -> str:
+    """Extract aws_region from raw model config."""
+    return str(
+        model_raw.get("aws_region")
+        or model_raw.get("awsRegion")
+        or "us-east-1"
+    ).strip()
