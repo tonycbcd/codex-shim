@@ -1140,9 +1140,11 @@ class ShimServer:
                     raise web.HTTPServiceUnavailable(
                         text=f"No Bedrock model configured for [{platform}]; add it to models.json with provider=bedrock"
                     )
-            elif platform == "chatgpt":
+            elif platform == "chatgpt" or str(platform).startswith("chatgpt-"):
                 if chatgpt_passthrough_available():
-                    model = str(body.get("model") or CHATGPT_MODEL_SLUG)
+                    model = _chatgpt_platform_upstream_model(platform) or CHATGPT_MODEL_SLUG
+                    body = dict(body)
+                    body["model"] = model
                     return await self._chatgpt_passthrough(
                         request,
                         body,
@@ -1215,11 +1217,13 @@ class ShimServer:
         header_platform = _prime_loopback_platform(request)
         explicit_platform = requested_platform or header_platform or prefix_platform or None
         platform = self._resolve_session_platform(request, explicit_platform)
-        if platform == "chatgpt" and chatgpt_passthrough_available():
-            model = str(body.get("model") or CHATGPT_MODEL_SLUG)
+        if (platform == "chatgpt" or str(platform).startswith("chatgpt-")) and chatgpt_passthrough_available():
+            model = _chatgpt_platform_upstream_model(platform) or CHATGPT_MODEL_SLUG
+            body = dict(body)
+            body["model"] = model
             upstream = chatgpt_upstream_model(model)
             return await self._chatgpt_compact_passthrough(request, body, upstream_model=upstream)
-        if platform == "chatgpt":
+        if platform == "chatgpt" or str(platform).startswith("chatgpt-"):
             print("[shim] ChatGPT compact unavailable; using default Claude gateway", flush=True)
         elif platform in BEDROCK_OPUS_PLATFORMS:
             bedrock_model_id, bedrock_source_tag = BEDROCK_OPUS_PLATFORMS[platform]
@@ -1835,8 +1839,8 @@ class ShimServer:
 
             # No error — prepare response and flush buffered lines
             _source_injected = False
-            # Determine source tag: show model name if using a fallback
-            _source_tag = "[ChatGPT]" if try_model == CHATGPT_MODEL_SLUG else f"[ChatGPT {try_model}]"
+            # Determine source tag from the actual upstream ChatGPT model.
+            _source_tag = _chatgpt_source_tag(try_model)
             try:
                 for line in buffered_lines:
                     if line == "[DONE]":
@@ -1847,6 +1851,10 @@ class ShimServer:
                     except json.JSONDecodeError:
                         await _safe_write(response, f"data: {line}\n\n".encode())
                         continue
+                    if payload.get("type") == "response.output_text.delta" and isinstance(payload.get("delta"), str):
+                        payload = dict(payload)
+                        payload["delta"] = _strip_leading_source_tags(payload["delta"])
+                    payload = _ensure_source_tag_on_response_completed(payload, _source_tag)
                     # Inject source tag before first content delta
                     if not _source_injected and payload.get("type") == "response.output_text.delta":
                         _source_injected = True
@@ -1869,6 +1877,10 @@ class ShimServer:
                         except json.JSONDecodeError:
                             await _safe_write(response, f"data: {line}\n\n".encode())
                             continue
+                        if payload.get("type") == "response.output_text.delta" and isinstance(payload.get("delta"), str):
+                            payload = dict(payload)
+                            payload["delta"] = _strip_leading_source_tags(payload["delta"])
+                        payload = _ensure_source_tag_on_response_completed(payload, _source_tag)
                         # Inject source tag before first content delta
                         if not _source_injected and payload.get("type") == "response.output_text.delta":
                             _source_injected = True
@@ -4104,12 +4116,14 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
     - "deepseek" for [deepseek]
     - "deepseek-pro" for [deepseek-pro]
     - "chatgpt" for [chatgpt]
+    - "chatgpt-5.4" for [chatgpt-5.4]
+    - "chatgpt-5.5" for [chatgpt-5.5]
     - "claude" for [claude], [claud], or [kiro]
     - None if no prefix found
     """
     import re
     prefix_pattern = re.compile(
-        r'^\s*\[(deepseek-pro|deepseek|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro)\]\s*',
+        r'^\s*\[(deepseek-pro|deepseek|chatgpt-5\.5|chatgpt-5\.4|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro)\]\s*',
         re.IGNORECASE,
     )
 
@@ -4191,6 +4205,40 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
                         return new_body, platform
 
     return body, None
+
+
+def _strip_leading_source_tags(text: str) -> str:
+    """Remove stacked leading source tags like [Claude], [claude-opus-4.6], [ChatGPT gpt-5.4]."""
+    if not isinstance(text, str) or not text:
+        return text
+    prefix_pattern = re.compile(
+        r'^\s*\[(deepseek-pro|deepseek|chatgpt(?:-[^\]]+)?|chatgpt [^\]]+|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claude [^\]]+|claud|kiro)\]\s*',
+        re.IGNORECASE,
+    )
+    current = text
+    while True:
+        match = prefix_pattern.match(current)
+        if not match:
+            return current.lstrip()
+        current = current[match.end():]
+
+
+def _chatgpt_platform_upstream_model(platform: str | None) -> str | None:
+    normalized = str(platform or "").strip().lower()
+    if normalized == "chatgpt":
+        return CHATGPT_MODEL_SLUG
+    if normalized == "chatgpt-5.4":
+        return "gpt-5.4"
+    if normalized == "chatgpt-5.5":
+        return "gpt-5.5"
+    if normalized == "chatgpt-5.6":
+        return "gpt-5.6-sol"
+    return None
+
+
+def _chatgpt_source_tag(model: str | None) -> str:
+    normalized = str(model or "").strip() or CHATGPT_MODEL_SLUG
+    return f"[chatgpt-{normalized.removeprefix('gpt-')}]"
 
 
 def _deepseek_available() -> bool:
@@ -4650,6 +4698,9 @@ def _is_deepseek_continuation(text: str) -> bool:
     return bool(
         re.match(
             r"^(继续|接着|再试|重试|再检查|再看看|继续修复|还有问题|不对|"
+            r"(?:ok|okay|go ahead|please fix|please do it|do it|directly fix|fix now|proceed)\b|"
+            r"(?:ok[,， ]*)?(?:直接修复|直接修改|直接改|直接做|直接处理|修复它|改它|就按这个修|就按这个改)|"
+            r"(?:好的|好|行|可以|嗯|那就|就)\s*(?:直接修复|直接修改|直接改|直接做|修复|修改|处理)|"
             r"continue\b|retry\b|try again\b|keep going\b|fix it\b)",
             normalized,
         )
@@ -4702,6 +4753,23 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
             f"(items={len(input_items)} tool_calls={deepseek_stats['tool_call_count']})",
             flush=True,
         )
+    # Hard stop: if too many tool calls have already been made without an edit,
+    # remove all tools so DeepSeek is forced to produce a text answer.
+    if deepseek_stats.get("tool_call_count", 0) >= 40 and deepseek_stats.get("edit_attempts", 0) == 0:
+        sanitized.pop("tools", None)
+        sanitized["instructions"] = (
+            sanitized.get("instructions", "")
+            + "\n\nCRITICAL: You have already made 40+ tool calls without any file edits. "
+            "Tools are now disabled. You MUST give a final text answer immediately: "
+            "state the exact file path, line numbers, and the minimal patch. Do not call any tools."
+        )
+        print(
+            f"[shim] DeepSeek tools REMOVED — tool_calls={deepseek_stats['tool_call_count']} "
+            "exceeds hard limit, forcing text response",
+            flush=True,
+        )
+        return sanitized
+
     force_execution_tools = _deepseek_should_force_execution_tools(deepseek_stats, latest_user_text)
     if force_execution_tools:
         instruction_blocks.append(
@@ -4716,9 +4784,15 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
         )
     sanitized["instructions"] = "\n\n".join(instruction_blocks)
 
-    # Keep several preceding user/assistant turns so follow-up questions retain
-    # the DSL, code, or decision they refer to. Older tool transcripts are
-    # intentionally dropped; only the active task's tool chain is replayed.
+    # Keep the active task narrow. DeepSeek degrades badly when unrelated prior
+    # tasks are replayed, especially in long Codex sessions where the client
+    # resends a large conversation history on every turn.
+    #
+    # Policy:
+    # - explicit continuation ("继续修复"/"retry"/etc.): keep the concrete task
+    #   it refers to plus its tool chain
+    # - normal new task: keep only the latest user task and the tool chain that
+    #   follows it; do not drag along several earlier user tasks
     context_start_index = latest_user_index
     tool_history_start_index = latest_user_index
     if latest_user_index is not None:
@@ -4727,19 +4801,14 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
             for index, user_index in enumerate(user_indices)
             if user_index <= latest_user_index
         )
-        context_position = max(0, anchor_position - 5)
-        context_start_index = user_indices[context_position]
         if current_user_index != latest_user_index:
+            context_start_index = user_indices[anchor_position]
             # A continuation such as "继续修复" depends on the full tool chain
             # since the concrete task it refers to.
             tool_history_start_index = latest_user_index
         else:
-            # For a normal follow-up, keep the immediately preceding turn's
-            # tool calls/results. They contain the files inspected, edits made,
-            # and verification results that the new request refers to.
-            current_position = len(user_indices) - 1
-            previous_position = max(0, current_position - 1)
-            tool_history_start_index = user_indices[previous_position]
+            context_start_index = latest_user_index
+            tool_history_start_index = latest_user_index
         tool_history_offset = tool_history_start_index - context_start_index
         current_turn_offset = current_user_index - context_start_index
         input_items = input_items[context_start_index:]
@@ -4881,20 +4950,30 @@ def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
         else:
             body["reasoning"] = {"effort": effort_env}
 
-    # Find reasoning items and strip old ones (keep last 6)
+    # ChatGPT Responses API requires ALL reasoning items to have content=[],
+    # regardless of age. Strip old ones' summaries too to save tokens.
     reasoning_indices = []
     for i, item in enumerate(input_items):
         if isinstance(item, dict) and item.get("type") == "reasoning":
             reasoning_indices.append(i)
 
-    if len(reasoning_indices) > 6:
-        for idx in reasoning_indices[:-6]:
-            item = input_items[idx]
-            # Responses API reasoning items only accept an empty content array.
-            # Adding an input_text placeholder makes the entire request invalid.
-            item["content"] = []
+    for i, idx in enumerate(reasoning_indices):
+        item = input_items[idx]
+        # ALL reasoning items must have content=[] — ChatGPT 400s if length > 0
+        item["content"] = []
+        # Also clear summary for older ones to save tokens (keep last 6)
+        if i < len(reasoning_indices) - 6:
             if "summary" in item:
                 item["summary"] = []
+
+    # Strip content from function_call / computer_call / custom_tool_call items
+    # — ChatGPT Responses API requires content=[] (max length 0) for these types.
+    for item in input_items:
+        if isinstance(item, dict) and item.get("type") in (
+            "function_call", "computer_call", "custom_tool_call"
+        ):
+            if item.get("content"):
+                item["content"] = []
 
     # Truncate long tool outputs (older than last 10 items)
     MAX_OUTPUT_LEN = 3000
@@ -4910,6 +4989,14 @@ def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
                             _truncate_tool_output(sub, MAX_OUTPUT_LEN)
 
     return body
+
+    # function_call items must have content=[] (max length 0).
+    # Strip any non-empty content array from function_call items to avoid
+    # ChatGPT 400: "array too long. Expected max length 0, but got length N"
+    for item in input_items:
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            if item.get("content"):
+                item["content"] = []
 
 
 def _truncate_tool_output(item: dict[str, Any], max_len: int) -> None:
@@ -4953,7 +5040,27 @@ def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
                 continue
             sanitized = _sanitize_chatgpt_passthrough_value(item)
             if sanitized is not _DROP_ITEM:
+                if (
+                    isinstance(sanitized, str)
+                    and key in {"content", "text", "input_text", "output_text"}
+                ):
+                    sanitized = _strip_leading_source_tags(sanitized)
                 output[key] = sanitized
+        item_type = str(output.get("type") or "")
+        # ChatGPT Responses API: items that require content=[] exactly
+        if item_type in {"function_call", "custom_tool_call", "computer_call"}:
+            output["content"] = []
+        elif item_type == "reasoning":
+            # reasoning items require content=[] (ALL reasoning items, not just old ones)
+            output["content"] = []
+            if "summary" in output:
+                if not isinstance(output.get("summary"), list):
+                    output["summary"] = []
+        elif item_type in {"web_search_call", "file_search_call", "code_interpreter_call",
+                           "mcp_call", "mcp_list_tools", "mcp_approval_request",
+                           "image_generation_call", "computer_call_output"}:
+            # These types do not accept a 'content' field at all — remove it entirely
+            output.pop("content", None)
         return output
     return value
 
@@ -4974,6 +5081,67 @@ def _rewrite_response_model(payload: Any, model: str | None) -> None:
     elif isinstance(payload, list):
         for item in payload:
             _rewrite_response_model(item, model)
+
+
+def _ensure_source_tag_on_response_completed(payload: dict[str, Any], source_tag: str | None) -> dict[str, Any]:
+    """Ensure the final Responses payload exposes the actual source/model tag.
+
+    For ChatGPT passthrough, some turns begin with tool calls and may never
+    receive the early text-delta tag injection. Patch the final
+    `response.completed` payload so the reconciled assistant message always
+    shows the source tag. If the response has no assistant message at all,
+    synthesize a minimal one containing just the tag.
+    """
+    if not source_tag or payload.get("type") != "response.completed":
+        return payload
+    response_obj = payload.get("response")
+    if not isinstance(response_obj, dict):
+        return payload
+    output = response_obj.get("output")
+    if not isinstance(output, list):
+        return payload
+
+    patched_payload = dict(payload)
+    patched_response = dict(response_obj)
+    patched_output = list(output)
+
+    for idx, item in enumerate(patched_output):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for cidx, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") != "output_text":
+                continue
+            text = part.get("text")
+            if not isinstance(text, str):
+                continue
+            stripped = _strip_leading_source_tags(text)
+            patched_item = dict(item)
+            patched_content = list(content)
+            patched_part = dict(part)
+            patched_part["text"] = f"{source_tag} {stripped}" if stripped else source_tag
+            patched_content[cidx] = patched_part
+            patched_item["content"] = patched_content
+            patched_output[idx] = patched_item
+            patched_response["output"] = patched_output
+            patched_payload["response"] = patched_response
+            return patched_payload
+
+    synthetic_item = {
+        "id": f"msg_src_{int(time.time() * 1000)}",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": source_tag, "annotations": []}],
+    }
+    patched_output.insert(0, synthetic_item)
+    patched_response["output"] = patched_output
+    patched_payload["response"] = patched_response
+    return patched_payload
 
 
 class AnthropicMessagesStreamState:
