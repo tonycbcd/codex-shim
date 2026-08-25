@@ -4154,12 +4154,13 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
     - "chatgpt" for [chatgpt]
     - "chatgpt-5.4" for [chatgpt-5.4]
     - "chatgpt-5.5" for [chatgpt-5.5]
+    - "chatgpt-5.6" for [chatgpt-5.6]
     - "claude" for [claude], [claud], or [kiro]
     - None if no prefix found
     """
     import re
     prefix_pattern = re.compile(
-        r'^\s*\[(deepseek-pro|deepseek|chatgpt-5\.5|chatgpt-5\.4|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro)\]\s*',
+        r'^\s*\[(deepseek-pro|deepseek|chatgpt-5\.6|chatgpt-5\.5|chatgpt-5\.4|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro)\]\s*',
         re.IGNORECASE,
     )
 
