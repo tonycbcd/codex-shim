@@ -803,10 +803,12 @@ class ShimServer:
 
     @staticmethod
     def _reset_oversized_deepseek_sessions() -> None:
-        """Reset the local index before JSON serialization can OOM Node.
+        """Prune the session index when it grows beyond the size limit.
 
-        Codex resends prompt history, so losing this local lookup index only
-        makes the adapter establish a fresh DeepSeek conversation.
+        Instead of wiping everything (which makes DeepSeek forget the current
+        conversation), keep the most-recently-updated sessions so the active
+        task can continue.  Older sessions are discarded to stay under the
+        size cap.
         """
         try:
             size = DEEPSEEK_SESSIONS_FILE.stat().st_size
@@ -815,16 +817,36 @@ class ShimServer:
         if size <= DEEPSEEK_MAX_SESSIONS_BYTES:
             return
 
+        # Try to prune rather than wipe so the current session survives.
         temporary = DEEPSEEK_SESSIONS_FILE.with_name(
             f"{DEEPSEEK_SESSIONS_FILE.name}.{os.getpid()}.reset"
         )
         try:
-            temporary.write_text(
-                '{"sessions":{},"convs":{}}\n',
-                encoding="utf-8",
+            try:
+                raw = DEEPSEEK_SESSIONS_FILE.read_text(encoding="utf-8")
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = {}
+
+            sessions: dict[str, Any] = parsed.get("sessions") or {}
+            convs: dict[str, Any] = parsed.get("convs") or {}
+
+            # Sort sessions by updatedAt descending and keep the 10 most recent.
+            KEEP = 10
+            sorted_ids = sorted(
+                sessions,
+                key=lambda sid: sessions[sid].get("updatedAt", 0) if isinstance(sessions[sid], dict) else 0,
+                reverse=True,
             )
+            kept_ids = set(sorted_ids[:KEEP])
+            pruned_sessions = {sid: sessions[sid] for sid in kept_ids}
+            # Rebuild convs to only reference kept sessions.
+            pruned_convs = {k: v for k, v in convs.items() if v in kept_ids}
+            payload = json.dumps({"sessions": pruned_sessions, "convs": pruned_convs}, ensure_ascii=False)
+            temporary.write_text(payload + "\n", encoding="utf-8")
             temporary.chmod(0o600)
             temporary.replace(DEEPSEEK_SESSIONS_FILE)
+            new_size = DEEPSEEK_SESSIONS_FILE.stat().st_size
         except OSError as exc:
             try:
                 temporary.unlink()
@@ -835,8 +857,8 @@ class ShimServer:
             ) from exc
 
         print(
-            f"[shim] Reset oversized DeepSeek session index: "
-            f"{size} bytes > {DEEPSEEK_MAX_SESSIONS_BYTES}",
+            f"[shim] Pruned DeepSeek session index: "
+            f"{size} -> {new_size} bytes (kept {len(pruned_sessions)}/{len(sessions)} sessions)",
             flush=True,
         )
 
@@ -1161,6 +1183,18 @@ class ShimServer:
                 )
 
         model = str(body.get("model") or "")
+        explicit_claude_platform = platform in {"claud", "claude", "kiro"}
+        if is_chatgpt_passthrough_slug(model) and not explicit_claude_platform:
+            if chatgpt_passthrough_available():
+                body = dict(body)
+                body["model"] = model
+                return await self._chatgpt_passthrough(
+                    request,
+                    body,
+                    upstream_model=chatgpt_upstream_model(model),
+                )
+            print("[shim] ⚠️  ChatGPT slug requested but unavailable, falling back to Claude", flush=True)
+
         if not is_chatgpt_passthrough_slug(model):
             if is_cursor_passthrough_slug(model):
                 return await self._cursor_passthrough(
@@ -1195,9 +1229,8 @@ class ShimServer:
                 return await self._post_bedrock(request, route, forwarded, as_responses=True)
             raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
-        # Claude/Kiro is the default platform. A ChatGPT model slug selected
-        # in the Codex UI must not silently opt into ChatGPT Web; only the
-        # explicit [chatgpt] prefix or first_platform=chatgpt may do that.
+        # Explicit Claude/Kiro, or ChatGPT passthrough unavailable, uses the
+        # local Claude gateway fallback. Otherwise ChatGPT slugs are handled above.
         print("[shim] Routing request to default Claude gateway", flush=True)
         claude_result = await self._claude_gateway_fallback(
             request,
@@ -1732,7 +1765,10 @@ class ShimServer:
             low = text.lower()
             return any(phrase in low for phrase in _STREAM_ERROR_PHRASES)
 
-        if response_model_override:
+        # Always parse ChatGPT SSE streams here so we can:
+        # 1) detect early in-stream errors before committing content, and
+        # 2) inject the actual ChatGPT model source tag in the assistant text.
+        if True:
             # Buffer SSE lines until we see actual content or an error.
             # "high demand" errors arrive AFTER metadata events (response.created,
             # response.in_progress) but BEFORE any content delta. So we buffer
@@ -4693,11 +4729,18 @@ def _deepseek_should_force_execution_tools(stats: dict[str, int], latest_user_te
 
 def _is_deepseek_continuation(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text.strip().lower())
-    if len(normalized) > 100:
+    # Continuation turns are usually short follow-ups such as "你再检查下",
+    # "Ok, 直接修复", "改对没", etc.  If we miss them, the DeepSeek
+    # compactor treats the turn as a brand-new task and drops the prior task
+    # context, which makes DeepSeek look memoryless inside Codex.
+    if len(normalized) > 140:
         return False
+    normalized = re.sub(r"^(?:你|请|麻烦|帮我|再帮我|please)\s*", "", normalized)
     return bool(
         re.match(
-            r"^(继续|接着|再试|重试|再检查|再看看|继续修复|还有问题|不对|"
+            r"^(继续|接着|再试|重试|再检查|再看看|检查下|看下|确认下|验证下|"
+            r"重新检查|继续修复|还有问题|还有没有问题|不对|这次呢|现在呢|"
+            r"改对没|改对了吗|修对没|修对了吗|什么情况|为啥|为什么还是|"
             r"(?:ok|okay|go ahead|please fix|please do it|do it|directly fix|fix now|proceed)\b|"
             r"(?:ok[,， ]*)?(?:直接修复|直接修改|直接改|直接做|直接处理|修复它|改它|就按这个修|就按这个改)|"
             r"(?:好的|好|行|可以|嗯|那就|就)\s*(?:直接修复|直接修改|直接改|直接做|修复|修改|处理)|"
@@ -4791,8 +4834,11 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
     # Policy:
     # - explicit continuation ("继续修复"/"retry"/etc.): keep the concrete task
     #   it refers to plus its tool chain
-    # - normal new task: keep only the latest user task and the tool chain that
-    #   follows it; do not drag along several earlier user tasks
+    # - normal new task: also keep the immediately preceding user turn and its
+    #   assistant/tool chain. Codex frequently sends contextual follow-ups that
+    #   are not phrased with one of the continuation keywords; keeping zero
+    #   prior turns made DeepSeek appear memoryless inside the same session.
+    #   Older tasks are still discarded to avoid cross-task pollution.
     context_start_index = latest_user_index
     tool_history_start_index = latest_user_index
     if latest_user_index is not None:
@@ -4807,8 +4853,9 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
             # since the concrete task it refers to.
             tool_history_start_index = latest_user_index
         else:
-            context_start_index = latest_user_index
-            tool_history_start_index = latest_user_index
+            previous_position = max(0, anchor_position - 1)
+            context_start_index = user_indices[previous_position]
+            tool_history_start_index = context_start_index
         tool_history_offset = tool_history_start_index - context_start_index
         current_turn_offset = current_user_index - context_start_index
         input_items = input_items[context_start_index:]
@@ -5020,6 +5067,39 @@ def _sanitize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
     sanitized["stream"] = True
     # Optimize context before sending
     sanitized = _optimize_input_context(sanitized)
+    # Final safety pass: strip any remaining 'content' on non-message items.
+    # This runs after both _sanitize_chatgpt_passthrough_value and _optimize_input_context
+    # to catch anything either step may have left behind.
+    input_items = sanitized.get("input")
+    if isinstance(input_items, list):
+        for idx, item in enumerate(input_items):
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            has_content = "content" in item
+            content_val = item.get("content")
+            item_role = str(item.get("role") or "")
+            # Treat items with role=user/assistant/system and no explicit type
+            # as message items — some Codex/Claude histories omit type="message".
+            _is_message_item = item_type == "message" or (
+                not item_type and item_role in {"user", "assistant", "system"}
+            )
+            if _is_message_item:
+                # Responses API requires message.content to exist. Some
+                # Codex/Claude histories contain assistant/tool-only message
+                # shells with no content, which caused ChatGPT 400:
+                # "Missing required parameter: input[0].content".
+                if not has_content or content_val is None:
+                    item["content"] = []
+                continue  # message items legitimately carry content
+            if has_content:
+                if item_type == "reasoning":
+                    # reasoning: content must be exactly [] (empty array present)
+                    item["content"] = []
+                else:
+                    # All non-message, non-reasoning types: remove content entirely
+                    # (function_call, custom_tool_call, computer_call, web_search_call, etc.)
+                    del item["content"]
     return sanitized
 
 
@@ -5047,19 +5127,27 @@ def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
                     sanitized = _strip_leading_source_tags(sanitized)
                 output[key] = sanitized
         item_type = str(output.get("type") or "")
-        # ChatGPT Responses API: items that require content=[] exactly
-        if item_type in {"function_call", "custom_tool_call", "computer_call"}:
-            output["content"] = []
+        item_role = str(output.get("role") or "")
+        # ChatGPT Responses API content rules (inverted logic — safer):
+        # Only "message" items legitimately carry a content array.
+        # Items with role=user/assistant/system (but no explicit type) are also
+        # message items — some Codex/Claude histories omit the "type" field.
+        _is_message_item = item_type == "message" or (
+            not item_type and item_role in {"user", "assistant", "system"}
+        )
+        if _is_message_item:
+            # message items: keep content as-is (user/assistant text lives here)
+            pass
         elif item_type == "reasoning":
-            # reasoning items require content=[] (ALL reasoning items, not just old ones)
+            # reasoning items require content=[] exactly (empty array must exist)
             output["content"] = []
             if "summary" in output:
                 if not isinstance(output.get("summary"), list):
                     output["summary"] = []
-        elif item_type in {"web_search_call", "file_search_call", "code_interpreter_call",
-                           "mcp_call", "mcp_list_tools", "mcp_approval_request",
-                           "image_generation_call", "computer_call_output"}:
-            # These types do not accept a 'content' field at all — remove it entirely
+        elif "content" in output:
+            # function_call, custom_tool_call, computer_call, web_search_call,
+            # function_call_output, and any other non-message type:
+            # 'content' field must be completely absent (not even content=[])
             output.pop("content", None)
         return output
     return value
