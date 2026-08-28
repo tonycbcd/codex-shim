@@ -18,6 +18,7 @@ from codex_shim.server import (
     _check_and_strip_platform_prefix,
     _claude_current_turn_failed_patch_count,
     _claude_current_turn_tool_call_count,
+    _configured_claude_gateway_model,
     _custom_tool_input,
     _current_managed_model,
     _deepseek_codegraph_project_hint,
@@ -77,6 +78,16 @@ def test_sanitize_chatgpt_passthrough_body_drops_shim_reasoning():
     assert [item["id"] for item in sanitized["input"] if item.get("type") == "reasoning"] == ["rs_openai"]
     assert sanitized["input"][1]["encrypted_content"] == "openai-verifiable-content"
     assert len(body["input"]) == 3
+
+
+def test_configured_claude_gateway_model_prefers_env(monkeypatch):
+    monkeypatch.setenv("CLAUDE_GATEWAY_MODEL", "claude-opus-4.5")
+    assert _configured_claude_gateway_model() == "claude-opus-4.5"
+
+
+def test_configured_claude_gateway_model_falls_back_to_default(monkeypatch):
+    monkeypatch.delenv("CLAUDE_GATEWAY_MODEL", raising=False)
+    assert _configured_claude_gateway_model() == "claude-sonnet-4.6"
 
 
 def test_prime_routing_identity_rejects_non_loopback_peer():
@@ -1479,6 +1490,28 @@ async def test_streaming_anthropic_response_completed_includes_usage():
     assert usage["output_tokens"] == 3
     assert usage["total_tokens"] == 8
     assert usage["input_tokens_details"]["cached_tokens"] == 4
+
+
+async def test_responses_stream_state_dedupes_repeated_source_tags_in_text():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("claude-sonnet-4.6", source_tag="[claude-sonnet-4.6]")
+    await state._text_delta(
+        downstream,
+        "[claude-opus-4.6] [claude-opus-4.6] 已同步。",
+    )
+    await state.finish(downstream)
+
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    deltas = [event["delta"] for event in events if event.get("type") == "response.output_text.delta"]
+    assert deltas[0] == "[claude-sonnet-4.6] 已同步。"
+    assert deltas.count("[claude-sonnet-4.6] 已同步。") == 1
 
 
 async def test_responses_compact_defaults_to_claude_gateway(monkeypatch, tmp_path):

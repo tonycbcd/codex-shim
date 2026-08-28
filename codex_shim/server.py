@@ -97,6 +97,13 @@ DEFAULT_CLAUDE_GATEWAY_URL = "http://127.0.0.1:8901/v1/chat/completions"
 # level" on this account, which is why default shim->Kiro requests failed.
 DEFAULT_CLAUDE_GATEWAY_MODEL = "claude-sonnet-4.6"
 
+
+def _configured_claude_gateway_model() -> str:
+    return os.environ.get(
+        "CLAUDE_GATEWAY_MODEL",
+        DEFAULT_CLAUDE_GATEWAY_MODEL,
+    ).strip() or DEFAULT_CLAUDE_GATEWAY_MODEL
+
 CLAUDE_EXECUTION_RULES = """Claude Codex execution contract:
 - For a small, localized code change, perform one focused discovery pass, then edit immediately.
 - Prefer apply_patch for source edits. Do not use line-number-based sed/Python deletion or backup-and-restore editing.
@@ -1235,7 +1242,7 @@ class ShimServer:
         claude_result = await self._claude_gateway_fallback(
             request,
             body,
-            response_model_override=DEFAULT_CLAUDE_GATEWAY_MODEL,
+            response_model_override=_configured_claude_gateway_model(),
         )
         if claude_result is not None:
             return claude_result
@@ -2925,7 +2932,7 @@ class ShimServer:
             print(f"[shim] Claude gateway error: {err_text[:300]}", flush=True)
             return None
 
-        model_name = response_model_override or DEFAULT_CLAUDE_GATEWAY_MODEL
+        model_name = claude_model or response_model_override or _configured_claude_gateway_model()
         tool_types = _build_tool_types(body)
         state = ResponsesStreamState(
             model_name,
@@ -2937,10 +2944,10 @@ class ShimServer:
                 provider="claude-gateway",
                 charge_key=charge_key,
             ) or usage,
+            source_tag=_claude_source_tag(model_name),
         )
 
         chunk_count = 0
-        source_injected = False
         pending_content = ""
         try:
             await state.start(response)
@@ -2960,14 +2967,13 @@ class ShimServer:
                     print(f"[shim] CLAUDE first delta keys: {list(delta.keys())} finish_reason={choices[0].get('finish_reason')}", flush=True)
                 chunk_count += 1
                 content = delta.get("content")
-                if isinstance(content, str) and not source_injected:
+                if isinstance(content, str) and not state._source_tag_injected:
                     pending_content += content
                     delta = dict(delta)
                     delta.pop("content", None)
                     candidate = pending_content.strip().lower()
                     if candidate and not "(empty placeholder)".startswith(candidate):
-                        source_injected = True
-                        delta["content"] = "[Claude] " + pending_content
+                        delta["content"] = pending_content
                         pending_content = ""
                     chunk = dict(chunk)
                     chunk["choices"] = [dict(choices[0], delta=delta)]
@@ -2981,7 +2987,7 @@ class ShimServer:
                                 "choices": [
                                     {
                                         "delta": {
-                                            "content": "[Claude] Claude 未生成有效回复，请重试本轮。"
+                                            "content": "Claude 未生成有效回复，请重试本轮。"
                                         }
                                     }
                                 ]
@@ -2992,10 +2998,27 @@ class ShimServer:
                         response,
                         {
                             "choices": [
-                                {"delta": {"content": "[Claude] " + pending_content}}
+                                {"delta": {"content": pending_content}}
                             ]
                         },
                     )
+            if not state.message_text.strip() and not state.tool_calls:
+                print(
+                    f"[shim] Claude gateway produced no assistant text; injecting fallback message (chunks={chunk_count})",
+                    flush=True,
+                )
+                await state.write_chat_delta(
+                    response,
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "content": "Claude 本轮没有返回可显示的正文内容，请直接重试本轮，或缩短上下文后再试。"
+                                }
+                            }
+                        ]
+                    },
+                )
             await state.finish(response)
         except ClientDisconnected:
             pass
@@ -3524,6 +3547,7 @@ class ShimServer:
         if as_responses:
             tool_types = _build_tool_types(body)
             payload = anthropic_to_response(payload, route.slug, tool_types)
+            payload = _ensure_source_tag_on_response_completed(payload, _claude_source_tag(route.model))
             payload = self._attach_cost_to_responses_payload(
                 request,
                 payload,
@@ -3761,6 +3785,7 @@ class ShimServer:
                     raw=route.raw,
                     charge_key=charge_key,
                 ) or usage,
+                source_tag=source_tag,
             )
             try:
                 await state.start(response)
@@ -3889,6 +3914,7 @@ class ShimServer:
             state = ResponsesStreamState(
                 route.slug,
                 tool_types,
+                source_tag=_claude_source_tag(route.model),
                 usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
                     request,
                     usage,
@@ -4276,6 +4302,11 @@ def _chatgpt_platform_upstream_model(platform: str | None) -> str | None:
 def _chatgpt_source_tag(model: str | None) -> str:
     normalized = str(model or "").strip() or CHATGPT_MODEL_SLUG
     return f"[chatgpt-{normalized.removeprefix('gpt-')}]"
+
+
+def _claude_source_tag(model: str | None) -> str:
+    normalized = str(model or "").strip() or DEFAULT_CLAUDE_GATEWAY_MODEL
+    return f"[{normalized}]"
 
 
 def _deepseek_available() -> bool:
@@ -5477,6 +5508,7 @@ class ResponsesStreamState:
         model: str,
         tool_types: dict[str, str] | None = None,
         usage_finalizer: Any = None,
+        source_tag: str | None = None,
     ):
         self.response_id = f"resp_{int(time.time() * 1000)}"
         self.message_item_id = f"msg_{int(time.time() * 1000)}"
@@ -5495,6 +5527,8 @@ class ResponsesStreamState:
         self.tool_types = tool_types or {}
         self.usage_finalizer = usage_finalizer
         self._usage_finalized = False
+        self.source_tag = source_tag
+        self._source_tag_injected = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -5515,6 +5549,27 @@ class ResponsesStreamState:
                     self.usage = finalized
             self._usage_finalized = True
         summary = self._format_cost_summary_text()
+        if not self.message_opened and (self.source_tag or summary):
+            await self._open_message(response)
+            bootstrap_parts: list[str] = []
+            if self.source_tag:
+                bootstrap_parts.append(self.source_tag)
+                self._source_tag_injected = True
+            if summary:
+                bootstrap_parts.append(summary)
+            bootstrap_text = "\n\n".join(part for part in bootstrap_parts if part)
+            if bootstrap_text:
+                self.message_text += bootstrap_text
+                await _write_sse(
+                    response,
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": self.message_item_id,
+                        "output_index": self.message_index,
+                        "content_index": 0,
+                        "delta": bootstrap_text,
+                    },
+                )
         if summary and self.message_opened and summary not in self.message_text:
             if not self.message_closed:
                 delta = ("\n\n" if self.message_text.rstrip() else "") + summary
@@ -5774,6 +5829,10 @@ class ResponsesStreamState:
     async def _text_delta(self, response: web.StreamResponse, text: str) -> None:
         if not text:
             return
+        if self.source_tag:
+            stripped = _strip_leading_source_tags(text)
+            text = f"{self.source_tag} {stripped}" if stripped else self.source_tag
+            self._source_tag_injected = True
         if not self.message_opened:
             await self._open_message(response)
         self.message_text += text
