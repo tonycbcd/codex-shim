@@ -2898,9 +2898,27 @@ class ShimServer:
 
         session = await self._get_session()
         response = prepared_response or _sse_response()
+        model_name = claude_model or response_model_override or _configured_claude_gateway_model()
+        tool_types = _build_tool_types(body)
+        state = ResponsesStreamState(
+            model_name,
+            tool_types,
+            usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
+                request,
+                usage,
+                model_name=model_name,
+                provider="claude-gateway",
+                charge_key=charge_key,
+            ) or usage,
+            source_tag=_claude_source_tag(model_name),
+        )
+        state_started = False
         if prepared_response is None and request is not None:
             await response.prepare(request)
             await _safe_write(response, b": codex-shim connected\n\n")
+        if request is not None:
+            await state.start(response)
+            state_started = True
         t0 = time.time()
         try:
             if request is None:
@@ -2918,6 +2936,22 @@ class ShimServer:
                 )
         except Exception as e:
             print(f"[shim] Claude gateway failed: {e}", flush=True)
+            if state_started:
+                await _write_sse(
+                    response,
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "server_error",
+                            "message": f"Claude gateway request failed before streaming began: {e}",
+                        },
+                    },
+                )
+                try:
+                    await response.write_eof()
+                except Exception:
+                    pass
+                return response
             return None
 
         t1 = time.time()
@@ -2930,27 +2964,30 @@ class ShimServer:
         if upstream.status >= 400:
             err_text = await upstream.text()
             print(f"[shim] Claude gateway error: {err_text[:300]}", flush=True)
+            if state_started:
+                await _write_sse(
+                    response,
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "server_error",
+                            "message": f"Claude gateway returned HTTP {upstream.status}: {err_text[:300]}",
+                        },
+                    },
+                )
+                try:
+                    await response.write_eof()
+                except Exception:
+                    pass
+                return response
             return None
-
-        model_name = claude_model or response_model_override or _configured_claude_gateway_model()
-        tool_types = _build_tool_types(body)
-        state = ResponsesStreamState(
-            model_name,
-            tool_types,
-            usage_finalizer=lambda usage, charge_key: self._attach_usage_cost(
-                request,
-                usage,
-                model_name=model_name,
-                provider="claude-gateway",
-                charge_key=charge_key,
-            ) or usage,
-            source_tag=_claude_source_tag(model_name),
-        )
 
         chunk_count = 0
         pending_content = ""
         try:
-            await state.start(response)
+            if not state_started:
+                await state.start(response)
+                state_started = True
             async for line in _sse_lines(upstream):
                 if line == "[DONE]":
                     print(f"[shim] CLAUDE stream done, chunks={chunk_count} content_len={len(state.message_text)}", flush=True)
@@ -3692,6 +3729,8 @@ class ShimServer:
                 merged[-1]["content"].extend(msg["content"])
             else:
                 merged.append(msg)
+        while merged and isinstance(merged[-1], dict) and merged[-1].get("role") == "assistant":
+            merged.pop()
         return merged
 
     async def _post_bedrock(
@@ -3839,7 +3878,16 @@ class ShimServer:
                 pass
             except Exception as exc:
                 print(f"[shim] Bedrock stream failed model={route.model}: {exc}", flush=True)
-                raise web.HTTPBadGateway(text=f"Bedrock invocation failed: {exc}")
+                await _write_sse(
+                    response,
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "server_error",
+                            "message": f"Bedrock invocation failed: {exc}",
+                        },
+                    },
+                )
             try:
                 await response.write_eof()
             except Exception:

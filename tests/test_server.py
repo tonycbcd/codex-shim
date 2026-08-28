@@ -30,6 +30,7 @@ from codex_shim.server import (
     _sanitize_deepseek_body,
     _sanitize_chatgpt_passthrough_body,
     _set_active_model,
+    _write_sse,
 )
 from codex_shim.settings import FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
 from codex_shim.translate import SHIM_ENCRYPTED_CONTENT_PREFIX
@@ -1512,6 +1513,136 @@ async def test_responses_stream_state_dedupes_repeated_source_tags_in_text():
     deltas = [event["delta"] for event in events if event.get("type") == "response.output_text.delta"]
     assert deltas[0] == "[claude-sonnet-4.6] 已同步。"
     assert deltas.count("[claude-sonnet-4.6] 已同步。") == 1
+
+
+def test_sanitize_bedrock_messages_drops_trailing_assistant_after_merge():
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "u1"}]},
+        {"role": "assistant", "content": [{"type": "thinking", "text": "hidden"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "prefill"}]},
+    ]
+
+    sanitized = ShimServer._sanitize_bedrock_messages(messages)
+
+    assert sanitized == [
+        {"role": "user", "content": [{"type": "text", "text": "u1"}]},
+    ]
+
+
+async def test_explicit_claude_stream_emits_response_created_before_gateway_503(monkeypatch, tmp_path):
+    class FailedResponse:
+        status = 503
+
+        async def text(self):
+            return "gateway unavailable"
+
+        def release(self):
+            return None
+
+    class FakeSession:
+        async def post(self, url, **kwargs):
+            return FailedResponse()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim = ShimServer(settings)
+
+    async def fake_get_session():
+        return FakeSession()
+
+    monkeypatch.setattr(shim, "_get_session", fake_get_session)
+    monkeypatch.setenv("CLAUDE_GATEWAY_API_KEY", "test-key")
+
+    shim_client = TestClient(TestServer(shim.app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "stream": True,
+            "input": [{"role": "user", "content": "[claude] test retry handling"}],
+        },
+    )
+    assert resp.status == 200
+    events = _sse_events(await resp.text())
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "error"
+    assert "Claude gateway returned HTTP 503" in events[-1]["error"]["message"]
+
+    await shim_client.close()
+
+
+async def test_bedrock_stream_failure_emits_sse_error_instead_of_aborting(tmp_path):
+    from aiohttp import web as aiohttp_web
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "us.anthropic.claude-opus-4-6-v1",
+                        "displayName": "Bedrock Claude",
+                        "provider": "bedrock",
+                        "baseURL": "bedrock://local",
+                    }
+                ]
+            }
+        )
+    )
+    shim = ShimServer(settings)
+
+    async def fake_post_bedrock(request, route, body, as_responses, source_tag=None):
+        response = aiohttp_web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await _write_sse(
+            response,
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_test",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "in_progress",
+                    "model": route.slug,
+                    "output": [],
+                },
+            },
+        )
+        await _write_sse(
+            response,
+            {
+                "type": "error",
+                "error": {
+                    "type": "server_error",
+                    "message": "Bedrock invocation failed: assistant prefill rejected",
+                },
+            },
+        )
+        await response.write_eof()
+        return response
+
+    shim._post_bedrock = fake_post_bedrock  # type: ignore[method-assign]
+
+    shim_client = TestClient(TestServer(shim.app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "stream": True,
+            "input": [{"role": "user", "content": "[claude-opus-4.6] verify"}],
+        },
+    )
+    assert resp.status == 200
+    events = _sse_events(await resp.text())
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "error"
+    assert "Bedrock invocation failed" in events[-1]["error"]["message"]
+
+    await shim_client.close()
 
 
 async def test_responses_compact_defaults_to_claude_gateway(monkeypatch, tmp_path):
