@@ -178,6 +178,8 @@ DEEPSEEK_EXECUTION_RULES = """DeepSeek Codex execution contract:
 - If a tool call fails because of arguments, immediately retry with only valid required arguments. Keep every integer tool argument as an integer, never as a decimal such as 20000.0.
 - Call configured tool names exactly. For CodeGraph use codegraph_explore with query and projectPath; never call an MCP namespace name directly.
 - Stay in the request's current project/workdir. Never scan / or unrelated repositories to guess the task.
+- Before broad exploration, check whether the environment already provides a matching local skill under /config/.codex/skills, /config/.codex/skills/.system, or ~/.codex/skills. Match by skill name, trigger phrases, repository/path hints, and task keywords.
+- If a matching local skill exists, read that skill's SKILL.md first and treat its fixed script paths, secret-file locations, helper scripts, and workflow steps as the source of truth instead of searching for alternate credentials, auth locations, or ad-hoc procedures.
 - Final reports for execution tasks must name changed files, summarize the actual diff, list verification commands and their real outcomes, and distinguish pre-existing changes from this task."""
 
 DEEPSEEK_FINISHING_RULES = """DeepSeek convergence rules:
@@ -406,6 +408,28 @@ class ShimServer:
                 flush=True,
             )
         return platform
+
+    @staticmethod
+    def _normalize_explicit_platform_model(
+        body: dict[str, Any],
+        platform: str | None,
+    ) -> dict[str, Any]:
+        """Normalize provider-specific explicit platform choices.
+
+        For Bedrock Opus prefixes, pin the model id explicitly so a stale body
+        model cannot drift to another provider. Plain ``[claude]`` does not
+        rewrite ``body.model`` because the default Claude gateway is selected by
+        control flow later in ``responses()``/``responses_compact()`` rather
+        than through ``_route()`` slug lookup.
+        """
+        if not platform:
+            return body
+
+        normalized = dict(body)
+        if platform in BEDROCK_OPUS_PLATFORMS:
+            model_id, _ = BEDROCK_OPUS_PLATFORMS[platform]
+            normalized["model"] = model_id
+        return normalized
 
     @staticmethod
     def _float_setting(*values: Any) -> float | None:
@@ -1129,6 +1153,7 @@ class ShimServer:
         # override prefixes retained in older conversation history.
         explicit_platform = requested_platform or header_platform or prefix_platform or None
         platform = self._resolve_session_platform(request, explicit_platform)
+        body = self._normalize_explicit_platform_model(body, explicit_platform)
         if platform:
             print(f"[shim] Platform prefix detected: [{platform}]", flush=True)
             if platform == "deepseek":
@@ -1191,6 +1216,17 @@ class ShimServer:
 
         model = str(body.get("model") or "")
         explicit_claude_platform = platform in {"claud", "claude", "kiro"}
+        if explicit_claude_platform:
+            print("[shim] Routing request to default Claude gateway", flush=True)
+            claude_result = await self._claude_gateway_fallback(
+                request,
+                body,
+                response_model_override=_configured_claude_gateway_model(),
+            )
+            if claude_result is not None:
+                return claude_result
+            raise web.HTTPBadGateway(text="Claude gateway on port 8901 is unavailable")
+
         if is_chatgpt_passthrough_slug(model) and not explicit_claude_platform:
             if chatgpt_passthrough_available():
                 body = dict(body)
@@ -1236,8 +1272,8 @@ class ShimServer:
                 return await self._post_bedrock(request, route, forwarded, as_responses=True)
             raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
-        # Explicit Claude/Kiro, or ChatGPT passthrough unavailable, uses the
-        # local Claude gateway fallback. Otherwise ChatGPT slugs are handled above.
+        # ChatGPT passthrough unavailable uses the local Claude gateway
+        # fallback. Explicit Claude/Kiro already returned above.
         print("[shim] Routing request to default Claude gateway", flush=True)
         claude_result = await self._claude_gateway_fallback(
             request,
@@ -1257,6 +1293,7 @@ class ShimServer:
         header_platform = _prime_loopback_platform(request)
         explicit_platform = requested_platform or header_platform or prefix_platform or None
         platform = self._resolve_session_platform(request, explicit_platform)
+        body = self._normalize_explicit_platform_model(body, explicit_platform)
         if (platform == "chatgpt" or str(platform).startswith("chatgpt-")) and chatgpt_passthrough_available():
             model = _chatgpt_platform_upstream_model(platform) or CHATGPT_MODEL_SLUG
             body = dict(body)
@@ -1294,6 +1331,14 @@ class ShimServer:
                     text=f"No Bedrock model configured for [{platform}]; add it to models.json with provider=bedrock"
                 )
         model = str(body.get("model") or "")
+        if platform in {"claud", "claude", "kiro"}:
+            print("[shim] Compact request using default Claude gateway", flush=True)
+            compact_body = _compact_request_body(body, _configured_claude_gateway_model())
+            return await self._claude_gateway_compact(
+                request,
+                compact_body,
+                response_model_override=_configured_claude_gateway_model(),
+            )
         if not is_chatgpt_passthrough_slug(model):
             if is_cursor_passthrough_slug(model):
                 compact_body = dict(body)
@@ -2937,6 +2982,7 @@ class ShimServer:
         except Exception as e:
             print(f"[shim] Claude gateway failed: {e}", flush=True)
             if state_started:
+                visible_message = f"Claude 网关请求失败：{e}"
                 await _write_sse(
                     response,
                     {
@@ -2947,6 +2993,19 @@ class ShimServer:
                         },
                     },
                 )
+                await state.write_chat_delta(
+                    response,
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "content": visible_message,
+                                }
+                            }
+                        ]
+                    },
+                )
+                await state.finish(response)
                 try:
                     await response.write_eof()
                 except Exception:
@@ -2965,6 +3024,9 @@ class ShimServer:
             err_text = await upstream.text()
             print(f"[shim] Claude gateway error: {err_text[:300]}", flush=True)
             if state_started:
+                visible_message = f"Claude 当前不可用：HTTP {upstream.status}。"
+                if "kiro-cli login" in err_text or "Token expired" in err_text:
+                    visible_message = "Claude 当前不可用：登录态已过期，请先运行 `kiro-cli login` 后再重试。"
                 await _write_sse(
                     response,
                     {
@@ -2975,6 +3037,19 @@ class ShimServer:
                         },
                     },
                 )
+                await state.write_chat_delta(
+                    response,
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "content": visible_message,
+                                }
+                            }
+                        ]
+                    },
+                )
+                await state.finish(response)
                 try:
                     await response.write_eof()
                 except Exception:
@@ -3730,6 +3805,8 @@ class ShimServer:
             else:
                 merged.append(msg)
         while merged and isinstance(merged[-1], dict) and merged[-1].get("role") == "assistant":
+            merged.pop()
+        while merged and isinstance(merged[-1], dict) and merged[-1].get("role") != "user":
             merged.pop()
         return merged
 
@@ -4791,6 +4868,50 @@ def _build_deepseek_finish_guidance(input_items: list[Any], latest_user_text: st
     )
 
 
+def _deepseek_is_skill_worthy_request(latest_user_text: str) -> bool:
+    text = latest_user_text.strip().lower()
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"\b(fix|implement|edit|modify|patch|change|update|write|create|refactor|debug|investigate|review|check|analyze|summarize|deploy|publish|scp|sync|copy|restart|test|build)\b|"
+            r"修|改|实现|补丁|更新|新增|调整|排查|检查|分析|总结|部署|发布|同步|复制|重启|测试|构建",
+            text,
+        )
+    )
+
+
+def _build_deepseek_skill_discovery_guidance(latest_user_text: str) -> str | None:
+    if not _deepseek_is_skill_worthy_request(latest_user_text):
+        return None
+    return (
+        "DeepSeek skill-discovery protocol: before broad repo exploration, first check whether this task matches "
+        "an installed local skill. Inspect /config/.codex/skills, /config/.codex/skills/.system, and ~/.codex/skills; "
+        "match by skill name, trigger phrases, repository/path hints, and task keywords from the user's latest request. "
+        "If a matching skill exists, read that skill's SKILL.md before any wider search, resolve any relative paths from "
+        "the skill directory, and prefer the skill's scripts/assets/templates over ad-hoc commands. If the skill defines "
+        "a fixed secret file, auth source, helper script, browser profile, or deployment workflow, use that as the source "
+        "of truth and do not wander to alternate credentials or random locations. Do not emit raw tool JSON/XML as plain text."
+    )
+
+
+def _build_deepseek_skill_guidance(latest_user_text: str) -> str | None:
+    text = latest_user_text.lower()
+    if re.search(r"scp\s*到\s*office|同步到\s*office|office.*\bscp\b|\bscp\b.*office", text):
+        return (
+            "DeepSeek local skill hint: this task matches the installed office-scp skill. "
+            "Read /config/.codex/skills/office-scp/SKILL.md before doing anything else. "
+            "Then follow it exactly: use script "
+            "/config/.codex/skills/office-scp/scripts/scp-to-office.sh, "
+            "local project root /opt/codes/ms/front, remote root E:\\ms\\front, "
+            "and password file ~/.codex/secrets/office-ssh-password. "
+            "Do not search for alternate office credentials, do not ask for auth if that file exists, "
+            "and do not emit raw tool JSON/XML as plain text. After reading the skill, call exec_command "
+            "to run the script with only the user-requested relative file paths."
+        )
+    return None
+
+
 def _deepseek_should_force_execution_tools(stats: dict[str, int], latest_user_text: str) -> bool:
     implementation_task = bool(
         re.search(
@@ -4868,6 +4989,12 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
             if not _is_deepseek_continuation(previous_text):
                 break
     deepseek_stats = _deepseek_tool_call_stats(input_items)
+    skill_discovery_guidance = _build_deepseek_skill_discovery_guidance(latest_user_text)
+    if skill_discovery_guidance:
+        instruction_blocks.append(skill_discovery_guidance)
+    skill_guidance = _build_deepseek_skill_guidance(latest_user_text)
+    if skill_guidance:
+        instruction_blocks.append(skill_guidance)
     finish_guidance = _build_deepseek_finish_guidance(input_items, latest_user_text)
     if finish_guidance:
         instruction_blocks.append(finish_guidance)
@@ -5877,7 +6004,7 @@ class ResponsesStreamState:
     async def _text_delta(self, response: web.StreamResponse, text: str) -> None:
         if not text:
             return
-        if self.source_tag:
+        if self.source_tag and not self._source_tag_injected:
             stripped = _strip_leading_source_tags(text)
             text = f"{self.source_tag} {stripped}" if stripped else self.source_tag
             self._source_tag_injected = True
@@ -6100,6 +6227,9 @@ class ResponsesStreamState:
             return None
         request_cost = self.usage.get("request_cost_usd")
         task_cost = self.usage.get("task_cost_usd")
+        # Only emit cost summary when at least one real value exists
+        if request_cost is None and task_cost is None:
+            return None
 
         def _fmt(value: Any) -> str:
             if value is None:

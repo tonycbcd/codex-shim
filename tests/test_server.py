@@ -240,6 +240,43 @@ def test_claude_execution_guidance_adds_loop_breaker_after_threshold():
     assert f"used {CLAUDE_LOOP_BREAK_TOOL_THRESHOLD} tool calls" in guidance["content"]
 
 
+def test_deepseek_skill_discovery_guidance_added_for_general_task():
+    body = {
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": "你去 /opt/codes/ms/search-service 结合codegraph 总结 waitlist 搜索逻辑",
+            }
+        ]
+    }
+
+    sanitized = _sanitize_deepseek_body(body)
+    instructions = sanitized["instructions"]
+
+    assert "DeepSeek skill-discovery protocol" in instructions
+    assert "/config/.codex/skills" in instructions
+    assert "/config/.codex/skills/.system" in instructions
+    assert "~/.codex/skills" in instructions
+    assert "read that skill's SKILL.md before any wider search" in instructions
+
+
+def test_deepseek_skill_discovery_guidance_skips_plain_greeting():
+    body = {
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": "Hello",
+            }
+        ]
+    }
+
+    sanitized = _sanitize_deepseek_body(body)
+
+    assert "DeepSeek skill-discovery protocol" not in sanitized["instructions"]
+
+
 async def test_claude_fallback_uses_configured_kiro_gateway(monkeypatch):
     requested = {}
 
@@ -406,6 +443,23 @@ def test_deepseek_execution_rules_require_real_edits_and_verification():
     assert "Never fabricate file contents, diffs, command output" in instructions
     assert "If no file was changed" in instructions
     assert "distinguish pre-existing changes from this task" in instructions
+    assert "matching local skill" in instructions
+
+
+def test_deepseek_office_scp_requests_get_skill_guidance():
+    sanitized = _sanitize_deepseek_body(
+        {
+            "input": [{"role": "user", "content": "你将修改的代码 scp 到 office 对应文件中"}],
+            "tools": [],
+        }
+    )
+
+    instructions = sanitized["instructions"]
+    assert "office-scp skill" in instructions
+    assert "/config/.codex/skills/office-scp/SKILL.md" in instructions
+    assert "/config/.codex/skills/office-scp/scripts/scp-to-office.sh" in instructions
+    assert "~/.codex/secrets/office-ssh-password" in instructions
+    assert "Do not search for alternate office credentials" in instructions
 
 
 def test_deepseek_context_keeps_previous_task_for_continue_message():
@@ -1527,6 +1581,64 @@ def test_sanitize_bedrock_messages_drops_trailing_assistant_after_merge():
     assert sanitized == [
         {"role": "user", "content": [{"type": "text", "text": "u1"}]},
     ]
+
+
+def test_sanitize_bedrock_messages_drops_non_user_tail_after_cleanup():
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "u1"}]},
+        {"role": "assistant", "content": [{"type": "thinking", "text": "hidden"}]},
+        {"role": "tool", "content": [{"type": "tool_result", "text": "ok"}]},
+    ]
+
+    sanitized = ShimServer._sanitize_bedrock_messages(messages)
+
+    assert sanitized == [
+        {"role": "user", "content": [{"type": "text", "text": "u1"}]},
+    ]
+
+
+def test_normalize_explicit_platform_model_claude_keeps_body_model():
+    body = {"model": "us-anthropic-claude-opus-5", "input": [{"role": "user", "content": "hi"}]}
+
+    normalized = ShimServer._normalize_explicit_platform_model(body, "claude")
+
+    assert normalized["model"] == "us-anthropic-claude-opus-5"
+    assert body["model"] == "us-anthropic-claude-opus-5"
+
+
+async def test_explicit_claude_platform_bypasses_stale_bedrock_model(monkeypatch, tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim = ShimServer(settings)
+    captured: dict[str, object] = {}
+
+    async def fake_gateway(request, body, response_model_override=None, prepared_response=None):
+        captured["body"] = body
+        captured["response_model_override"] = response_model_override
+        return web.json_response({"ok": True, "via": "claude-gateway"})
+
+    monkeypatch.setattr(shim, "_claude_gateway_fallback", fake_gateway)
+
+    app = shim.app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/v1/responses",
+            json={
+                "model": "us-anthropic-claude-opus-5",
+                "stream": False,
+                "input": [{"role": "user", "content": "[claude] hi"}],
+            },
+        )
+        assert resp.status == 200
+        payload = await resp.json()
+        assert payload["via"] == "claude-gateway"
+        assert captured["response_model_override"] == _configured_claude_gateway_model()
+        assert isinstance(captured["body"], dict)
+        assert captured["body"]["model"] == "us-anthropic-claude-opus-5"
+    finally:
+        await client.close()
 
 
 async def test_explicit_claude_stream_emits_response_created_before_gateway_503(monkeypatch, tmp_path):
