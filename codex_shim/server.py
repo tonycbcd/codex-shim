@@ -2825,6 +2825,7 @@ class ShimServer:
         """Proxy Responses traffic through the vendored codeproxy adapter."""
         use_pro = str(body.get("model") or "").lower() == DEEPSEEK_MODEL_PRO
         ds_model = DEEPSEEK_MODEL_PRO if use_pro else DEEPSEEK_MODEL_STANDARD
+        source_tag = "[deepseek-pro]" if use_pro else "[deepseek]"
         forwarded_body = _sanitize_deepseek_body(body)
         forwarded_body["model"] = ds_model
         forwarded_body["stream"] = body.get("stream", True)
@@ -2893,8 +2894,22 @@ class ShimServer:
         )
         await downstream.prepare(request)
         try:
-            async for chunk in upstream.content.iter_any():
-                await downstream.write(chunk)
+            async for line in _sse_lines(upstream):
+                if line == "[DONE]":
+                    await downstream.write(b"data: [DONE]\n\n")
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    await downstream.write(f"data: {line}\n\n".encode())
+                    continue
+                _rewrite_response_model(payload, "deepseek-pro" if use_pro else "deepseek")
+                payload = _ensure_source_tag_on_response_completed(payload, source_tag)
+                payload = _sanitize_deepseek_codeproxy_event(payload, source_tag)
+                if payload is None:
+                    print("[shim] Suppressed DeepSeek codeproxy internal markup event", flush=True)
+                    continue
+                await _write_sse(downstream, payload)
         except (ConnectionResetError, _asyncio.CancelledError):
             upstream.close()
             raise
@@ -4496,6 +4511,161 @@ def _strip_deepseek_source_tag(item: dict[str, Any]) -> None:
             if isinstance(part.get(key), str):
                 part[key] = prefix.sub("", part[key], count=1)
                 return
+
+
+def _is_deepseek_internal_result_text(text: str) -> bool:
+    stripped = _strip_leading_source_tags(text).strip()
+    if not stripped:
+        return False
+    if ShimServer._is_malformed_tool_call(stripped):
+        return True
+    return bool(
+        re.search(
+            r"(?is)"
+            r"(?:^|</?function_results>\s*)<result>\s*<check>.*?</check>\s*</result>\s*(?:</function_results>)?\s*$|"
+            r"^</function_results>\s*$|"
+            r"^<function_results>\s*$|"
+            r"^<result>\s*$|"
+            r"^</result>\s*$|"
+            r"<parameter\b|<invoke\b|<execute_command\b|<exec_command\b|</function_results>",
+            stripped,
+        )
+    )
+
+
+def _sanitize_deepseek_output_text(text: str, source_tag: str | None = None) -> str:
+    stripped = _strip_leading_source_tags(text).strip()
+    if _is_deepseek_internal_result_text(stripped):
+        return ""
+    if source_tag:
+        return f"{source_tag} {stripped}" if stripped else source_tag
+    return stripped
+
+
+def _sanitize_deepseek_output_item(
+    item: dict[str, Any],
+    source_tag: str | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    if not isinstance(item, dict):
+        return item, False
+    if item.get("type") == "function_call":
+        return item, False
+    if item.get("type") != "message" or item.get("role") != "assistant":
+        return item, False
+    content = item.get("content")
+    if not isinstance(content, list):
+        return item, False
+
+    patched_item = dict(item)
+    patched_content: list[dict[str, Any]] = []
+    visible_text = False
+    for part in content:
+        if not isinstance(part, dict):
+            patched_content.append(part)
+            continue
+        if part.get("type") != "output_text":
+            patched_content.append(part)
+            continue
+        text = part.get("text")
+        if not isinstance(text, str):
+            patched_content.append(part)
+            continue
+        cleaned_text = _sanitize_deepseek_output_text(text, source_tag)
+        if not cleaned_text or cleaned_text == source_tag:
+            continue
+        patched_part = dict(part)
+        patched_part["text"] = cleaned_text
+        patched_content.append(patched_part)
+        visible_text = True
+
+    if not patched_content:
+        return None, False
+    patched_item["content"] = patched_content
+    return patched_item, visible_text
+
+
+def _sanitize_deepseek_completed_payload(
+    payload: dict[str, Any],
+    source_tag: str | None = None,
+) -> dict[str, Any]:
+    if payload.get("type") != "response.completed":
+        return payload
+    response_obj = payload.get("response")
+    if not isinstance(response_obj, dict):
+        return payload
+    output = response_obj.get("output")
+    if not isinstance(output, list):
+        return payload
+
+    patched_payload = dict(payload)
+    patched_response = dict(response_obj)
+    patched_output: list[dict[str, Any]] = []
+    saw_function_call = False
+    saw_visible_assistant_text = False
+
+    for item in output:
+        if not isinstance(item, dict):
+            patched_output.append(item)
+            continue
+        if item.get("type") == "function_call":
+            saw_function_call = True
+            patched_output.append(item)
+            continue
+        cleaned_item, visible = _sanitize_deepseek_output_item(item, source_tag)
+        if cleaned_item is not None:
+            patched_output.append(cleaned_item)
+        if item.get("type") == "message" and item.get("role") == "assistant" and visible:
+            saw_visible_assistant_text = True
+
+    if not saw_visible_assistant_text:
+        fallback_text = (
+            f"{source_tag} 已完成工具执行，请查看上方命令结果与代码变更。"
+            if saw_function_call and source_tag
+            else (source_tag or "Completed.")
+        )
+        patched_output.append(
+            {
+                "id": f"msg_ds_{int(time.time() * 1000)}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": fallback_text, "annotations": []}],
+            }
+        )
+
+    patched_response["output"] = patched_output
+    patched_payload["response"] = patched_response
+    return patched_payload
+
+
+def _sanitize_deepseek_codeproxy_event(
+    payload: dict[str, Any],
+    source_tag: str | None = None,
+) -> dict[str, Any] | None:
+    event_type = payload.get("type")
+    if event_type == "response.output_text.delta":
+        delta = payload.get("delta")
+        if isinstance(delta, str):
+            cleaned = _sanitize_deepseek_output_text(delta, None)
+            if not cleaned:
+                return None
+            patched = dict(payload)
+            patched["delta"] = cleaned
+            return patched
+        return payload
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        item = payload.get("item")
+        if isinstance(item, dict):
+            cleaned_item, _ = _sanitize_deepseek_output_item(item, source_tag)
+            if cleaned_item is None:
+                return None
+            patched = dict(payload)
+            patched["item"] = cleaned_item
+            return patched
+        return payload
+    if event_type == "response.completed":
+        return _sanitize_deepseek_completed_payload(payload, source_tag)
+    return payload
 
 
 def _strip_deepseek_previous_calls_text(text: str) -> str:

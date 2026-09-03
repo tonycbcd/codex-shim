@@ -23,11 +23,14 @@ from codex_shim.server import (
     _current_managed_model,
     _deepseek_codegraph_project_hint,
     _deepseek_stream_failure,
+    _is_deepseek_internal_result_text,
     _normalize_apply_patch_input,
     _picker_html,
     _prime_loopback_platform,
     _rewrite_response_model,
+    _sanitize_deepseek_codeproxy_event,
     _sanitize_deepseek_body,
+    _sanitize_deepseek_completed_payload,
     _sanitize_chatgpt_passthrough_body,
     _set_active_model,
     _write_sse,
@@ -275,6 +278,52 @@ def test_deepseek_skill_discovery_guidance_skips_plain_greeting():
     sanitized = _sanitize_deepseek_body(body)
 
     assert "DeepSeek skill-discovery protocol" not in sanitized["instructions"]
+
+
+def test_detect_deepseek_internal_result_text():
+    assert _is_deepseek_internal_result_text("<result>\n<check>patch applied</check>\n</result>\n</function_results>")
+    assert _is_deepseek_internal_result_text('{"tool_calls":[{"name":"exec_command","arguments":{"cmd":"pwd"}}]}')
+    assert not _is_deepseek_internal_result_text("已完成修改，并通过语法检查。")
+
+
+def test_sanitize_deepseek_codeproxy_event_suppresses_internal_delta():
+    payload = {
+        "type": "response.output_text.delta",
+        "delta": "<result>\n<check>patch applied</check>\n</result>\n</function_results>",
+    }
+
+    assert _sanitize_deepseek_codeproxy_event(payload, "[deepseek-pro]") is None
+
+
+def test_sanitize_deepseek_completed_payload_replaces_internal_only_message():
+    payload = {
+        "type": "response.completed",
+        "response": {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "<result><check>patch applied</check></result></function_results>",
+                        }
+                    ],
+                },
+            ]
+        },
+    }
+
+    sanitized = _sanitize_deepseek_completed_payload(payload, "[deepseek-pro]")
+    messages = [item for item in sanitized["response"]["output"] if item.get("type") == "message"]
+
+    assert messages
+    assert messages[-1]["content"][0]["text"] == "[deepseek-pro] 已完成工具执行，请查看上方命令结果与代码变更。"
 
 
 async def test_claude_fallback_uses_configured_kiro_gateway(monkeypatch):
