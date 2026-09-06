@@ -88,8 +88,15 @@ KIMI_MODEL_K3  = "kimi-k3"
 
 # Kimi official API (Moonshot AI)
 KIMI_API_BASE   = "https://api.kimi.com/coding/v1/chat/completions"
-KIMI_API_KEY    = "sk-kimi-gWHJk41Ta1fcdaJIrdKoB1l9aPzccNnIgVYDdclp5tgucqmHZCTWiZ3Y8r8Kymrj"
+KIMI_API_KEY_FILE = Path(__file__).resolve().parents[1] / ".kimi-web-data" / ".api-key"
 KIMI_API_MODEL  = "kimi-for-coding"
+
+def _get_kimi_api_key() -> str:
+    """Read Kimi official API key from .kimi-web-data/.api-key."""
+    try:
+        return KIMI_API_KEY_FILE.read_text().strip()
+    except Exception:
+        return ""
 
 # Grok Web API configuration (Playwright Node service)
 GROK_API_BASE    = "http://127.0.0.1:8767"
@@ -100,8 +107,15 @@ GROK_MODEL_BUILD = "grok-build"
 
 # xAI official API configuration
 XAI_API_BASE  = "https://api.x.ai/v1/responses"
-XAI_API_KEY   = "xai-kpuRL6KOGfn0FCmgneNOHEs2Wao53nkTuq7dazd8IqpWyBimN7yO84vewLaPqeiKCuDCr3thh2YWOSTK"
+XAI_API_KEY_FILE = Path(__file__).resolve().parents[1] / ".xai-web-data" / ".api-key"
 XAI_MODEL_4_6 = "grok-4.6"
+
+def _get_xai_api_key() -> str:
+    """Read xAI API key from .xai-web-data/.api-key."""
+    try:
+        return XAI_API_KEY_FILE.read_text().strip()
+    except Exception:
+        return ""
 BEDROCK_OPUS_5   = "us.anthropic.claude-opus-5"
 BEDROCK_OPUS_4_8 = "us.anthropic.claude-opus-4-8"
 BEDROCK_OPUS_4_7 = "us.anthropic.claude-opus-4-7"
@@ -1222,7 +1236,11 @@ class ShimServer:
             elif platform == "kimi":
                 return await self._kimi_passthrough(request, body)
             elif platform == "kimi-k3":
-                return await self._kimi_passthrough(request, body)
+                return await self._kimi_api_passthrough(
+                    request, body, model=KIMI_MODEL_K3, source_tag="[kimi-k3]"
+                )
+            elif platform == "kimi-k2.7":
+                return await self._kimi_api_passthrough(request, body)
             elif platform in {"grok", "grok-build"}:
                 return await self._grok_passthrough(request, body)
             elif platform == "grok-4.6":
@@ -2648,7 +2666,7 @@ class ShimServer:
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Authorization": f"Bearer {_get_xai_api_key()}",
         }
 
         url = XAI_API_BASE
@@ -2742,17 +2760,50 @@ class ShimServer:
         self,
         request: web.Request,
         body: dict[str, Any],
+        model: str | None = None,
+        source_tag: str | None = None,
     ) -> web.StreamResponse:
         """Forward a Responses request to Kimi official coding API (api.kimi.com)."""
         import json as _json
 
-        source_tag = "[kimi-k2.7]"
+        if source_tag is None:
+            source_tag = "[kimi-k2.7]"
+        if model is None:
+            model = KIMI_API_MODEL
         wants_stream = body.get("stream", True)
         resp_id = f"kimi-{uuid.uuid4().hex[:12]}"
 
         # Convert Responses API → chat/completions format
-        chat_body = responses_to_chat(body, KIMI_API_MODEL)
+        chat_body = responses_to_chat(body, model)
         chat_body["stream"] = wants_stream
+
+        # Loop-breaking: count tool calls in history and inject finish guidance
+        _kimi_tool_count = sum(
+            1 for item in (body.get("input") or [])
+            if isinstance(item, dict) and item.get("type") in {"function_call", "custom_tool_call"}
+        )
+        if _kimi_tool_count >= 30:
+            # Hard stop: strip tools so Kimi is forced to produce a text answer
+            chat_body.pop("tools", None)
+            chat_body.pop("tool_choice", None)
+            print(f"[shim] kimi-k3 hard-stop: {_kimi_tool_count} tool calls — tools stripped", flush=True)
+        elif _kimi_tool_count >= 12:
+            # Inject finish guidance into system message
+            _finish_hint = (
+                f"\n\nKimi finish-now: This turn has already used {_kimi_tool_count} tool calls. "
+                "Stop broad exploration. Either make the minimal needed edit now or report the exact "
+                "blocker in one sentence. Do not read more files or run more searches unless the next "
+                "edit is impossible without that specific information."
+            )
+            _msgs = chat_body.get("messages") or []
+            if _msgs and _msgs[0].get("role") == "system":
+                _msgs[0]["content"] = (_msgs[0].get("content") or "") + _finish_hint
+            elif _msgs:
+                _msgs.insert(0, {"role": "system", "content": _finish_hint})
+            print(f"[shim] kimi-k3 finish-guidance injected: {_kimi_tool_count} tool calls", flush=True)
+
+        # Sanitize messages: Kimi/Moonshot 400 when:
+
 
         # Sanitize messages: Kimi/Moonshot 400 when:
         # 1. assistant tool_calls not immediately followed by tool results
@@ -2907,7 +2958,7 @@ class ShimServer:
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {KIMI_API_KEY}",
+            "Authorization": f"Bearer {_get_kimi_api_key()}",
         }
 
         session = ClientSession(timeout=ClientTimeout(total=300, connect=15))
@@ -3162,7 +3213,7 @@ class ShimServer:
         body: dict[str, Any],
     ) -> web.StreamResponse:
         """Forward a Responses request to the Kimi web API."""
-        source_tag = "[kimi-k3]"
+        source_tag = "[kimi]"
         try:
             tokens = self._kimi_load_tokens()
         except Exception as exc:

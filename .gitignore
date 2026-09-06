@@ -3,6 +3,7 @@
 .deepseek-web-data/
 .kimi-web-data/
 .grok-web-data/
+.xai-web-data/
 vendor/deepseek-web-api/node_modules/
 *.log
 *.pid
