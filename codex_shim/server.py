@@ -80,6 +80,28 @@ DEEPSEEK_SESSIONS_FILE = Path(__file__).resolve().parents[1] / ".deepseek-web-da
 DEEPSEEK_MAX_SESSIONS_BYTES = 32 * 1024 * 1024
 DEEPSEEK_MODEL_STANDARD = "deepseek-v4-flash"
 DEEPSEEK_MODEL_PRO = "deepseek-v4-pro"
+
+# Kimi Web API configuration (direct REST, no Chrome)
+KIMI_AUTH_FILE = Path(__file__).resolve().parents[1] / ".kimi-web-data" / "auth.json"
+KIMI_BASE_URL  = "https://kimi.moonshot.cn"
+KIMI_MODEL_K3  = "kimi-k3"
+
+# Kimi official API (Moonshot AI)
+KIMI_API_BASE   = "https://api.kimi.com/coding/v1/chat/completions"
+KIMI_API_KEY    = "sk-kimi-gWHJk41Ta1fcdaJIrdKoB1l9aPzccNnIgVYDdclp5tgucqmHZCTWiZ3Y8r8Kymrj"
+KIMI_API_MODEL  = "kimi-for-coding"
+
+# Grok Web API configuration (Playwright Node service)
+GROK_API_BASE    = "http://127.0.0.1:8767"
+GROK_AUTH_FILE   = Path(__file__).resolve().parents[1] / ".grok-web-data" / "auth.json"
+GROK_RUN_SCRIPT  = Path(__file__).resolve().parents[1] / ".grok-web-data" / "run.sh"
+GROK_LOG_FILE    = Path(__file__).resolve().parents[1] / ".grok-web-data" / "server.log"
+GROK_MODEL_BUILD = "grok-build"
+
+# xAI official API configuration
+XAI_API_BASE  = "https://api.x.ai/v1/responses"
+XAI_API_KEY   = "xai-kpuRL6KOGfn0FCmgneNOHEs2Wao53nkTuq7dazd8IqpWyBimN7yO84vewLaPqeiKCuDCr3thh2YWOSTK"
+XAI_MODEL_4_6 = "grok-4.6"
 BEDROCK_OPUS_5   = "us.anthropic.claude-opus-5"
 BEDROCK_OPUS_4_8 = "us.anthropic.claude-opus-4-8"
 BEDROCK_OPUS_4_7 = "us.anthropic.claude-opus-4-7"
@@ -373,6 +395,9 @@ class ShimServer:
        self._deepseek_log_handle: Any | None = None
        self._deepseek_idle_handle: asyncio.TimerHandle | None = None
        self._deepseek_idle_seconds: float = 30.0
+       self._grok_lock = asyncio.Lock()
+       self._grok_process: asyncio.subprocess.Process | None = None
+       self._grok_log_handle: Any | None = None
        self._session_platforms: dict[str, str] = {}
        self._session_costs: dict[str, dict[str, Any]] = {}
 
@@ -1194,6 +1219,14 @@ class ShimServer:
                     raise web.HTTPServiceUnavailable(
                         text=f"No Bedrock model configured for [{platform}]; add it to models.json with provider=bedrock"
                     )
+            elif platform == "kimi":
+                return await self._kimi_passthrough(request, body)
+            elif platform == "kimi-k3":
+                return await self._kimi_passthrough(request, body)
+            elif platform in {"grok", "grok-build"}:
+                return await self._grok_passthrough(request, body)
+            elif platform == "grok-4.6":
+                return await self._xai_passthrough(request, body)
             elif platform == "chatgpt" or str(platform).startswith("chatgpt-"):
                 if chatgpt_passthrough_available():
                     model = _chatgpt_platform_upstream_model(platform) or CHATGPT_MODEL_SLUG
@@ -2468,6 +2501,922 @@ class ShimServer:
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+
+
+
+    # ── Grok Web API passthrough ──────────────────────────────────────────────
+
+    async def _grok_healthcheck(self) -> bool:
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=5)) as s:
+                async with s.get(f"{GROK_API_BASE}/health") as r:
+                    return r.status < 500
+        except Exception:
+            return False
+
+    async def _start_grok_service(self) -> None:
+        if self._grok_process is not None and self._grok_process.returncode is None:
+            return
+        if not GROK_RUN_SCRIPT.is_file():
+            raise RuntimeError(f"Grok launcher not found: {GROK_RUN_SCRIPT}")
+        GROK_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self._grok_log_handle = GROK_LOG_FILE.open("ab", buffering=0)
+        self._grok_process = await asyncio.create_subprocess_exec(
+            str(GROK_RUN_SCRIPT),
+            stdout=self._grok_log_handle,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        # Phase 1: wait for HTTP server to come up (fast, ~2s)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            process = self._grok_process
+            if process is None or process.returncode is not None:
+                await self._stop_grok_service()
+                raise RuntimeError("Grok Web API exited during startup")
+            if await self._grok_healthcheck():
+                print(f"[shim] Grok Web API HTTP server up pid={process.pid}", flush=True)
+                break
+            await asyncio.sleep(0.5)
+        else:
+            await self._stop_grok_service()
+            raise RuntimeError("Grok Web API HTTP server did not start within 15 seconds")
+        # Phase 2: wait for browser to load grok.com (slow, ~30-60s)
+        print("[shim] Waiting for Grok browser to load grok.com...", flush=True)
+        ready = await self._grok_health_ready()
+        if not ready:
+            await self._stop_grok_service()
+            raise RuntimeError("Grok browser did not load grok.com within 90 seconds")
+        print(f"[shim] Grok Web API ready pid={self._grok_process.pid}", flush=True)
+
+    async def _grok_health_ready(self) -> bool:
+        """Wait until the grok service reports ready:true (browser loaded)."""
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            try:
+                async with ClientSession(timeout=ClientTimeout(total=5)) as s:
+                    async with s.get(f"{GROK_API_BASE}/health") as r:
+                        if r.status == 200:
+                            d = await r.json(content_type=None)
+                            if d.get("ready"):
+                                return True
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        return False
+
+    async def _stop_grok_service(self) -> None:
+        proc = self._grok_process
+        self._grok_process = None
+        if proc is not None:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                try: proc.kill()
+                except Exception: pass
+        if self._grok_log_handle is not None:
+            try: self._grok_log_handle.close()
+            except Exception: pass
+            self._grok_log_handle = None
+
+    async def _grok_passthrough(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+    ) -> web.StreamResponse:
+        """Forward a Responses request to the local Grok Web API service."""
+        # Ensure service is running
+        async with self._grok_lock:
+            if self._grok_process is None or self._grok_process.returncode is not None:
+                await self._start_grok_service()
+
+        wants_stream = body.get("stream", True)
+        forward_body = dict(body)
+        forward_body["stream"] = wants_stream
+        # Tag model so grok service picks build vs fast mode
+        forward_body.setdefault("model", "grok-build")
+
+        url = f"{GROK_API_BASE}/v1/responses"
+        session = ClientSession(timeout=ClientTimeout(total=120, connect=10))
+        try:
+            resp = await session.post(
+                url,
+                json=forward_body,
+                headers={"Content-Type": "application/json"},
+            )
+            if resp.status >= 400:
+                err = await resp.text()
+                raise web.HTTPBadGateway(text=f"Grok service error ({resp.status}): {err}")
+
+            if not wants_stream:
+                data = await resp.json(content_type=None)
+                return web.json_response(data)
+
+            downstream = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+            await downstream.prepare(request)
+            async for chunk in resp.content.iter_any():
+                if chunk:
+                    await downstream.write(chunk)
+            await downstream.write_eof()
+            return downstream
+        finally:
+            await session.close()
+
+    # ── Kimi Web API passthrough ──────────────────────────────────────────────
+    # ── xAI official API passthrough ─────────────────────────────────────────
+
+    async def _xai_passthrough(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+    ) -> web.StreamResponse:
+        """Forward a Responses API request to the xAI official API."""
+        wants_stream = body.get("stream", True)
+
+        # Convert Responses API body to xAI format (compatible with OpenAI Responses API)
+        forward_body = dict(body)
+        forward_body["model"] = XAI_MODEL_4_6
+        forward_body["stream"] = wants_stream
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {XAI_API_KEY}",
+        }
+
+        url = XAI_API_BASE
+        source_tag = "[grok-4.6]"
+
+        session = ClientSession(timeout=ClientTimeout(total=300, connect=15))
+        try:
+            resp = await session.post(url, json=forward_body, headers=headers)
+            if resp.status >= 400:
+                err = await resp.text()
+                raise web.HTTPBadGateway(text=f"xAI API error ({resp.status}): {err}")
+
+            if not wants_stream:
+                data = await resp.json(content_type=None)
+                # Inject source tag into non-streaming response
+                try:
+                    for item in data.get("output", []):
+                        if item.get("type") == "message":
+                            for block in item.get("content", []):
+                                if block.get("type") == "output_text":
+                                    txt = block.get("text", "")
+                                    if not txt.startswith(source_tag):
+                                        block["text"] = f"{source_tag} {txt}"
+                except Exception:
+                    pass
+                return web.json_response(data)
+
+            # Streaming: proxy SSE events, inject source tag on first text delta
+            downstream = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+            await downstream.prepare(request)
+            tag_injected = False
+            import json as _json
+            buf = b""
+            async for chunk in resp.content.iter_any():
+                if not chunk:
+                    continue
+                buf += chunk
+                while b"\n\n" in buf:
+                    line_block, buf = buf.split(b"\n\n", 1)
+                    for line in line_block.split(b"\n"):
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            if line:
+                                await downstream.write(line + b"\n")
+                            continue
+                        raw = line[5:].strip()
+                        if raw in (b"[DONE]", b""):
+                            await downstream.write(line + b"\n\n")
+                            continue
+                        try:
+                            evt = _json.loads(raw)
+                            # Inject source tag on first output_text_delta
+                            if not tag_injected and evt.get("type") == "response.output_text.delta":
+                                delta = evt.get("delta", "")
+                                evt["delta"] = f"{source_tag} {delta}"
+                                tag_injected = True
+                            # Also inject on response.completed output text
+                            if evt.get("type") == "response.completed":
+                                try:
+                                    for item in evt.get("response", {}).get("output", []):
+                                        if item.get("type") == "message":
+                                            for block in item.get("content", []):
+                                                if block.get("type") == "output_text":
+                                                    txt = block.get("text", "")
+                                                    if not txt.startswith(source_tag):
+                                                        block["text"] = f"{source_tag} {txt}"
+                                except Exception:
+                                    pass
+                            patched = _json.dumps(evt, ensure_ascii=False)
+                            await downstream.write(b"data: " + patched.encode() + b"\n\n")
+                        except Exception:
+                            await downstream.write(line + b"\n\n")
+            if buf.strip():
+                await downstream.write(buf)
+            await downstream.write_eof()
+            return downstream
+        finally:
+            await session.close()
+
+
+    # ── Kimi official API passthrough (kimi-k2.7) ───────────────────────────────
+
+    async def _kimi_api_passthrough(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+    ) -> web.StreamResponse:
+        """Forward a Responses request to Kimi official coding API (api.kimi.com)."""
+        import json as _json
+
+        source_tag = "[kimi-k2.7]"
+        wants_stream = body.get("stream", True)
+        resp_id = f"kimi-{uuid.uuid4().hex[:12]}"
+
+        # Convert Responses API → chat/completions format
+        chat_body = responses_to_chat(body, KIMI_API_MODEL)
+        chat_body["stream"] = wants_stream
+
+        # Sanitize messages: Kimi/Moonshot 400 when:
+        # 1. assistant tool_calls not immediately followed by tool results
+        # 2. barrier (user) messages appear inside an open tool round
+        # 3. empty string content on any message
+        # Logic ported from opencodex openai-chat.ts dangling tool_calls hardening.
+        def _content_to_str_kimi(c) -> str:
+            if c is None:
+                return ""
+            if isinstance(c, list):
+                return " ".join(
+                    (i.get("text") or "") for i in c if isinstance(i, dict)
+                ).strip()
+            return str(c).strip()
+
+        def _sanitize_kimi_messages(msgs: list) -> list:
+            out = []
+            pending_tool_calls = []   # list of {"id": str, "name": str}
+            deferred_barriers = []    # user msgs deferred while tool round is open
+
+            def release_deferred():
+                if deferred_barriers:
+                    out.extend(deferred_barriers)
+                    deferred_barriers.clear()
+
+            def flush_pending():
+                """Close open tool round with synthetic unavailable-result messages."""
+                if not pending_tool_calls:
+                    return
+                for call in pending_tool_calls:
+                    out.append({
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": f"[shim] no tool result recorded for '{call['name']}'; status unknown.",
+                    })
+                pending_tool_calls.clear()
+                release_deferred()
+
+            minted_seq = [0]
+            seen_ids = set()
+
+            def mint_id():
+                while True:
+                    minted_seq[0] += 1
+                    cid = f"call_shim_{minted_seq[0]}"
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        return cid
+
+            for m in msgs:
+                m = dict(m)
+                role = m.get("role", "")
+                content = m.get("content")
+                tool_calls = m.get("tool_calls") or []
+                c_str = _content_to_str_kimi(content)
+
+                if role == "assistant":
+                    if tool_calls:
+                        # Close any previously open round first
+                        flush_pending()
+                        # Ensure content is "" not null (xAI/Kimi require at least empty string)
+                        # Strip text content from tool_call turns (opencodex pattern):
+                        # Kimi returns empty responses when assistant has text+tool_calls together
+                        m["content"] = ""
+                        # Register wire ids
+                        wire_calls = []
+                        for tc in tool_calls:
+                            cid = tc.get("id") or mint_id()
+                            seen_ids.add(cid)
+                            wire_calls.append({"id": cid, "name": (tc.get("function") or {}).get("name") or "tool"})
+                        out.append(m)
+                        pending_tool_calls.extend(wire_calls)
+                    else:
+                        # Pure text assistant — skip if completely empty
+                        if not c_str:
+                            continue
+                        if isinstance(content, list):
+                            m["content"] = c_str
+                        flush_pending()
+                        out.append(m)
+
+                elif role == "tool":
+                    tool_call_id = m.get("tool_call_id") or ""
+                    match_idx = next(
+                        (i for i, c in enumerate(pending_tool_calls) if c["id"] == tool_call_id),
+                        -1
+                    )
+                    tc_content = c_str or "[no output]"
+                    m["content"] = tc_content
+
+                    if match_idx >= 0:
+                        out.append(m)
+                        pending_tool_calls.pop(match_idx)
+                        if not pending_tool_calls:
+                            release_deferred()
+                    else:
+                        # Orphan tool result: inject synthetic assistant call first
+                        flush_pending()
+                        cid = tool_call_id or f"call_orphan_{len(out)}"
+                        seen_ids.add(cid)
+                        name = m.get("name") or "tool_result"
+                        out.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{"id": cid, "type": "function",
+                                           "function": {"name": name, "arguments": "{}"}}],
+                        })
+                        m["tool_call_id"] = cid
+                        out.append(m)
+
+                else:
+                    # user / system: replace empty with placeholder
+                    if not c_str and not tool_calls:
+                        m["content"] = "..."
+                    elif isinstance(content, list):
+                        m["content"] = c_str or "..."
+                    # Barrier: if tool round is open, defer this user message
+                    if pending_tool_calls:
+                        deferred_barriers.append(m)
+                    else:
+                        out.append(m)
+
+            # Trailing dangling tool calls
+            flush_pending()
+            release_deferred()
+            return out
+
+        chat_body["messages"] = _sanitize_kimi_messages(chat_body.get("messages", []))
+
+        # Normalize tool format: Responses API uses flat format, Kimi requires nested
+        def _normalize_kimi_tools(tools: list) -> list:
+            out = []
+            for t in tools:
+                if not isinstance(t, dict):
+                    continue
+                if "function" in t:
+                    # Already nested format
+                    out.append(t)
+                else:
+                    # Flat Responses API format → nested chat format
+                    fn: dict = {
+                        "name": t.get("name", ""),
+                        "description": t.get("description", ""),
+                        "parameters": t.get("parameters") or t.get("input_schema") or {},
+                    }
+                    out.append({"type": "function", "function": fn})
+            return out
+
+        raw_tools = chat_body.get("tools")
+        if raw_tools:
+            chat_body["tools"] = _normalize_kimi_tools(raw_tools)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {KIMI_API_KEY}",
+        }
+
+        session = ClientSession(timeout=ClientTimeout(total=300, connect=15))
+        try:
+            resp = await session.post(KIMI_API_BASE, json=chat_body, headers=headers)
+            if resp.status >= 400:
+                err = await resp.text()
+                raise web.HTTPBadGateway(text=f"Kimi API error ({resp.status}): {err}")
+
+            if not wants_stream:
+                data = await resp.json(content_type=None)
+                usage = data.get("usage", {})
+                output = []
+                text_tagged = False
+                for choice in data.get("choices", []):
+                    msg = choice.get("message", {})
+                    content = (msg.get("content") or "").strip()
+                    tool_calls = msg.get("tool_calls") or []
+                    # Emit text message if present
+                    if content:
+                        tag = f"{source_tag} " if not text_tagged else ""
+                        text_tagged = True
+                        output.append({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": f"{tag}{content}"}],
+                        })
+                    # Emit function_call items for each tool call
+                    for tc in tool_calls:
+                        fn = tc.get("function") or {}
+                        output.append({
+                            "type": "function_call",
+                            "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                            "name": fn.get("name") or "tool",
+                            "arguments": fn.get("arguments") or "{}",
+                        })
+                # If Kimi returned nothing at all, emit empty message
+                if not output:
+                    output.append({"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": source_tag}]})
+                return web.json_response({
+                    "id": data.get("id", resp_id),
+                    "object": "response",
+                    "model": KIMI_API_MODEL,
+                    "output": output,
+                    "usage": {
+                        "input_tokens": usage.get("prompt_tokens", 0),
+                        "output_tokens": usage.get("completion_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    },
+                })
+
+            # Streaming: emit full Responses API envelope
+            downstream = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+            await downstream.prepare(request)
+
+            async def _emit(obj: dict) -> None:
+                await downstream.write(
+                    f"data: {_json.dumps(obj)}\n\n".encode("utf-8")
+                )
+
+            # Emit required envelope events so Codex client can start rendering
+            await _emit({"type": "response.created", "response": {
+                "id": resp_id, "object": "response", "model": KIMI_API_MODEL,
+                "status": "in_progress", "output": [],
+            }})
+            await _emit({"type": "response.output_item.added", "output_index": 0,
+                         "item": {"type": "message", "role": "assistant", "content": []}})
+            await _emit({"type": "response.content_part.added", "output_index": 0,
+                         "content_index": 0, "part": {"type": "output_text", "text": ""}})
+
+            first_text = True
+            full_text = ""
+            input_tokens = 0
+            output_tokens = 0
+            # tool call accumulator: {index: {id, name, arguments_buf}}
+            tc_accum: dict = {}
+            tc_emitted: set = set()  # indices where output_item.added was sent
+            text_item_started = False
+
+            async for line in _sse_lines(resp):
+                if not line or line == "[DONE]":
+                    continue
+                try:
+                    evt = _json.loads(line)
+                except Exception:
+                    continue
+
+                if evt.get("usage"):
+                    u = evt["usage"]
+                    input_tokens = u.get("prompt_tokens", input_tokens)
+                    output_tokens = u.get("completion_tokens", output_tokens)
+
+                for choice in evt.get("choices", []):
+                    delta = choice.get("delta", {})
+                    finish = choice.get("finish_reason")
+
+                    # ── text delta ──
+                    text = delta.get("content") or ""
+                    if text:
+                        if not text_item_started:
+                            # text item envelope already emitted above (index 0)
+                            text_item_started = True
+                        if first_text:
+                            text = f"{source_tag} {text}"
+                            first_text = False
+                        full_text += text
+                        await _emit({
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": text,
+                        })
+
+                    # ── tool_call deltas ──
+                    for tc_delta in (delta.get("tool_calls") or []):
+                        idx = tc_delta.get("index", 0)
+                        if idx not in tc_accum:
+                            tc_accum[idx] = {
+                                "id": tc_delta.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                                "name": (tc_delta.get("function") or {}).get("name") or "",
+                                "arguments_buf": "",
+                            }
+                        tc = tc_accum[idx]
+                        fn = tc_delta.get("function") or {}
+                        if fn.get("name"):
+                            tc["name"] = fn["name"]
+                        if tc_delta.get("id"):
+                            tc["id"] = tc_delta["id"]
+                        arg_chunk = fn.get("arguments") or ""
+                        if arg_chunk:
+                            # First arg chunk: emit output_item.added for this tool call
+                            if idx not in tc_emitted:
+                                tc_emitted.add(idx)
+                                # close text item envelope if open
+                                if text_item_started or not first_text:
+                                    await _emit({"type": "response.content_part.done",
+                                                 "output_index": 0, "content_index": 0,
+                                                 "part": {"type": "output_text", "text": full_text}})
+                                    await _emit({"type": "response.output_item.done",
+                                                 "output_index": 0,
+                                                 "item": {"type": "message", "role": "assistant",
+                                                          "content": [{"type": "output_text", "text": full_text}]}})
+                                    text_item_started = False
+                                tc_out_idx = 1 + idx
+                                await _emit({"type": "response.output_item.added",
+                                             "output_index": tc_out_idx,
+                                             "item": {"type": "function_call",
+                                                       "call_id": tc["id"],
+                                                       "name": tc["name"],
+                                                       "arguments": ""}})
+                            tc["arguments_buf"] += arg_chunk
+                            tc_out_idx = 1 + idx
+                            await _emit({"type": "response.function_call_arguments.delta",
+                                         "output_index": tc_out_idx,
+                                         "delta": arg_chunk})
+
+            # ── Close text item if no tool calls ──
+            if not tc_emitted:
+                await _emit({"type": "response.content_part.done", "output_index": 0,
+                             "content_index": 0,
+                             "part": {"type": "output_text", "text": full_text}})
+                await _emit({"type": "response.output_item.done", "output_index": 0,
+                             "item": {"type": "message", "role": "assistant",
+                                      "content": [{"type": "output_text", "text": full_text}]}})
+
+            # ── Close tool call items ──
+            final_output = []
+            if full_text or not tc_emitted:
+                final_output.append({"type": "message", "role": "assistant",
+                                     "content": [{"type": "output_text", "text": full_text}]})
+            for idx in sorted(tc_emitted):
+                tc = tc_accum[idx]
+                tc_out_idx = 1 + idx
+                await _emit({"type": "response.function_call_arguments.done",
+                             "output_index": tc_out_idx,
+                             "arguments": tc["arguments_buf"]})
+                await _emit({"type": "response.output_item.done",
+                             "output_index": tc_out_idx,
+                             "item": {"type": "function_call",
+                                      "call_id": tc["id"],
+                                      "name": tc["name"],
+                                      "arguments": tc["arguments_buf"]}})
+                final_output.append({"type": "function_call",
+                                     "call_id": tc["id"],
+                                     "name": tc["name"],
+                                     "arguments": tc["arguments_buf"]})
+
+            await _emit({"type": "response.completed", "response": {
+                "id": resp_id, "object": "response", "model": KIMI_API_MODEL,
+                "status": "completed",
+                "output": final_output,
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                          "total_tokens": input_tokens + output_tokens},
+            }})
+            await downstream.write_eof()
+            return downstream
+        finally:
+            await session.close()
+
+    def _kimi_load_tokens(self) -> dict:
+        """Load auth tokens from .kimi-web-data/auth.json, auto-refreshing if expired."""
+        import time as _time, json as _json
+        auth_path = KIMI_AUTH_FILE
+        if not auth_path.exists():
+            raise RuntimeError(f"Kimi auth file not found: {auth_path}. Run the refresh script first.")
+        data = _json.loads(auth_path.read_text(encoding="utf-8"))
+        # Decode JWT exp without external libs
+        access_token = data.get("access_token", "")
+        exp = 0
+        try:
+            import base64
+            payload_b64 = access_token.split(".")[1]
+            # Add padding
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            exp = _json.loads(base64.urlsafe_b64decode(payload_b64)).get("exp", 0)
+        except Exception:
+            pass
+        if exp and _time.time() > exp - 60:
+            # Refresh using refresh_token
+            import urllib.request, urllib.error
+            refresh_token = data.get("refresh_token", "")
+            if not refresh_token:
+                raise RuntimeError("Kimi refresh_token missing from auth.json")
+            try:
+                req = urllib.request.Request(
+                    f"{KIMI_BASE_URL}/api/auth/token/refresh",
+                    headers={"Authorization": f"Bearer {refresh_token}", "Referer": f"{KIMI_BASE_URL}/"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    refreshed = _json.loads(resp.read())
+                data["access_token"] = refreshed["access_token"]
+                if "refresh_token" in refreshed:
+                    data["refresh_token"] = refreshed["refresh_token"]
+                KIMI_AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+                KIMI_AUTH_FILE.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                print("[shim] Kimi access_token refreshed", flush=True)
+            except Exception as exc:
+                print(f"[shim] Kimi token refresh failed: {exc}", flush=True)
+        return data
+
+    async def _kimi_passthrough(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+    ) -> web.StreamResponse:
+        """Forward a Responses request to the Kimi web API."""
+        source_tag = "[kimi-k3]"
+        try:
+            tokens = self._kimi_load_tokens()
+        except Exception as exc:
+            raise web.HTTPServiceUnavailable(text=f"Kimi auth error: {exc}")
+
+        access_token = tokens["access_token"]
+        headers_kimi = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Referer": f"{KIMI_BASE_URL}/",
+            "Origin": KIMI_BASE_URL,
+        }
+
+        # Extract conversation text from Responses input
+        def _extract_content_text(content) -> str:
+            """Flatten Responses-API content list to plain text."""
+            if isinstance(content, str):
+                return content
+            if not isinstance(content, list):
+                return ""
+            parts = []
+            for p in content:
+                if isinstance(p, dict):
+                    parts.append(p.get("text") or p.get("input_text") or "")
+                elif isinstance(p, str):
+                    parts.append(p)
+            return "\n".join(filter(None, parts))
+
+        def _extract_messages(b: dict) -> list[dict]:
+            """Convert Responses-API input+instructions to [{role, content}] for Kimi.
+
+            Includes:
+            - instructions as a system message
+            - user/assistant chat turns
+            - function_call items as assistant tool-use summaries
+            - function_call_output items as user tool-result summaries
+            """
+            msgs: list[dict] = []
+
+            # System: Codex execution guidance + any user instructions
+            system_parts = [CLAUDE_EXECUTION_RULES]
+            instructions = b.get("instructions") or ""
+            if isinstance(instructions, str) and instructions.strip():
+                system_parts.append(instructions.strip())
+            msgs.append({"role": "system", "content": "\n\n".join(system_parts)})
+
+            inp = b.get("input") or []
+            if isinstance(inp, str):
+                msgs.append({"role": "user", "content": inp})
+                return msgs
+
+            for item in inp:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                role = item.get("role", "user")
+
+                # Tool call: function_call
+                if item_type == "function_call":
+                    name = item.get("name", "")
+                    args = item.get("arguments", "")
+                    call_id = item.get("call_id", "")
+                    msgs.append({
+                        "role": "assistant",
+                        "content": f"[Tool call] {name}({args})"
+                        + (f" [call_id={call_id}]" if call_id else ""),
+                    })
+                    continue
+
+                # Tool result: function_call_output
+                if item_type == "function_call_output":
+                    output = item.get("output", "")
+                    call_id = item.get("call_id", "")
+                    msgs.append({
+                        "role": "user",
+                        "content": f"[Tool result{(f' call_id={call_id}' if call_id else '')}]\n{output}",
+                    })
+                    continue
+
+                # Regular user/assistant message
+                content = _extract_content_text(item.get("content") or "")
+                if role in ("user", "assistant", "system") and content:
+                    msgs.append({"role": role, "content": content})
+
+            # Ensure at least one user message at end
+            if not msgs or msgs[-1]["role"] != "user":
+                if len(msgs) == 1 and msgs[0]["role"] == "system":
+                    msgs.append({"role": "user", "content": ""})
+            return msgs
+
+        messages = _extract_messages(body)
+
+        # Kimi does not support the "system" role — merge any leading system
+        # messages into the first user message so context is preserved.
+        def _kimi_merge_system(msgs: list) -> list:
+            system_parts = []
+            rest = []
+            for m in msgs:
+                if m.get("role") == "system":
+                    system_parts.append(m["content"])
+                else:
+                    rest.append(m)
+            if not system_parts:
+                return rest or [{"role": "user", "content": ""}]
+            system_text = "\n\n".join(system_parts)
+            # Prepend to first user message, or create one
+            merged = list(rest)
+            for i, m in enumerate(merged):
+                if m.get("role") == "user":
+                    merged[i] = dict(m)
+                    merged[i]["content"] = system_text + "\n\n" + m["content"]
+                    return merged
+            # No user message found — create one
+            return [{"role": "user", "content": system_text}] + merged
+
+        messages = _kimi_merge_system(messages)
+
+        session = ClientSession(timeout=self.timeout)
+        try:
+            # Step 1: create a new conversation
+            create_resp = await session.post(
+                f"{KIMI_BASE_URL}/api/chat",
+                json={"name": "codex", "is_example": False},
+                headers=headers_kimi,
+            )
+            if create_resp.status >= 400:
+                err = await create_resp.text()
+                raise web.HTTPBadGateway(text=f"Kimi create chat failed ({create_resp.status}): {err}")
+            chat_data = await create_resp.json(content_type=None)
+            chat_id = chat_data.get("id")
+            if not chat_id:
+                raise web.HTTPBadGateway(text="Kimi: no chat id returned")
+
+            # Step 2: stream completion
+            kimi_body = {
+                "messages": messages,
+                "use_search": False,
+                "extend": {"sidebar": True},
+                "kimiplus_id": "kimi",
+                "use_research": False,
+                "refs": [],
+                "refs_file": [],
+            }
+            stream_resp = await session.post(
+                f"{KIMI_BASE_URL}/api/chat/{chat_id}/completion/stream",
+                json=kimi_body,
+                headers={**headers_kimi, "Accept": "text/event-stream"},
+            )
+            if stream_resp.status >= 400:
+                err = await stream_resp.text()
+                raise web.HTTPBadGateway(text=f"Kimi stream failed ({stream_resp.status}): {err}")
+
+            wants_stream = body.get("stream", True)
+            if not wants_stream:
+                # Accumulate full text
+                full_text = ""
+                async for line in _sse_lines(stream_resp):
+                    if line in ("[DONE]", ""):
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("event") == "cmpl":
+                        full_text += ev.get("text", "")
+                response_id = f"resp_{uuid.uuid4().hex[:24]}"
+                result = {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": int(time.time()),
+                    "status": "completed",
+                    "model": KIMI_MODEL_K3,
+                    "output": [{
+                        "type": "message",
+                        "id": f"msg_{uuid.uuid4().hex[:24]}",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": f"{source_tag} {full_text}"}],
+                    }],
+                }
+                return web.json_response(result)
+
+            # Streaming: translate Kimi SSE → Responses SSE
+            downstream = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+            await downstream.prepare(request)
+            response_id = f"resp_{uuid.uuid4().hex[:24]}"
+            msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+            source_injected = False
+
+            async def _emit(payload: dict) -> None:
+                await downstream.write(
+                    f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+                )
+
+            await _emit({
+                "type": "response.created",
+                "response": {
+                    "id": response_id, "object": "response",
+                    "created_at": int(time.time()), "status": "in_progress",
+                    "model": KIMI_MODEL_K3,
+                },
+            })
+            await _emit({"type": "response.output_item.added", "output_index": 0,
+                          "item": {"type": "message", "id": msg_id, "status": "in_progress",
+                                   "role": "assistant", "content": []}})
+            await _emit({"type": "response.content_part.added", "output_index": 0,
+                          "content_index": 0, "part": {"type": "output_text", "text": ""}})
+
+            try:
+                async for line in _sse_lines(stream_resp):
+                    if line in ("[DONE]", ""):
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("event") != "cmpl":
+                        continue
+                    text_chunk = ev.get("text", "")
+                    if not text_chunk:
+                        continue
+                    if not source_injected:
+                        text_chunk = f"{source_tag} {text_chunk}"
+                        source_injected = True
+                    await _emit({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": text_chunk,
+                    })
+            except (ConnectionResetError, Exception):
+                pass
+
+            await _emit({"type": "response.content_part.done", "output_index": 0,
+                          "content_index": 0})
+            await _emit({"type": "response.output_item.done", "output_index": 0,
+                          "item": {"type": "message", "id": msg_id, "status": "completed",
+                                   "role": "assistant"}})
+            await _emit({"type": "response.completed",
+                          "response": {"id": response_id, "object": "response",
+                                       "created_at": int(time.time()), "status": "completed",
+                                       "model": KIMI_MODEL_K3}})
+            await downstream.write(b"data: [DONE]\n\n")
+            await downstream.write_eof()
+            return downstream
+        finally:
+            await session.close()
 
     async def _deepseek_passthrough(
         self,
@@ -4326,7 +5275,7 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
     """
     import re
     prefix_pattern = re.compile(
-        r'^\s*\[(deepseek-pro|deepseek|chatgpt-5\.6|chatgpt-5\.5|chatgpt-5\.4|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro)\]\s*',
+        r'^\s*\[(deepseek-pro|deepseek|chatgpt-5\.6|chatgpt-5\.5|chatgpt-5\.4|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro|kimi-k2\.7|kimi-k3|kimi|grok-4\.6|grok-build|grok)\]\s*',
         re.IGNORECASE,
     )
 
@@ -4335,6 +5284,8 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
         # keep claude-opus-X variants as-is; normalize aliases
         if platform in {"claud", "kiro"}:
             return "claude"
+        if platform in {"kimi-k3"}:
+            return "kimi-k3"
         return platform
 
     def strip_all_leading_prefixes(text: str) -> tuple[str, str | None]:
@@ -5122,7 +6073,7 @@ def _is_deepseek_continuation(text: str) -> bool:
 
 
 def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
-    """Keep the current task/tool chain small enough for DeepSeek Web."""
+    """Keep the current task/tool chain small enough for DeepSeek Web."""  # noqa: E501
     sanitized = json.loads(json.dumps(body))
     existing_instructions = sanitized.get("instructions")
     instruction_blocks = [
@@ -5350,12 +6301,22 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
-def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
-    """Optimize input context to reduce token count without losing conversation structure.
+def _clip_text_middle(text: str, limit: int) -> str:
+    """Clip text to limit chars, keeping head and tail with a marker in the middle."""
+    if len(text) <= limit:
+        return text
+    marker = "\n...[context truncated]...\n"
+    remaining = max(0, limit - len(marker))
+    head = remaining // 2
+    return f"{text[:head]}{marker}{text[-(remaining - head):]}"
 
+
+def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
+    """Optimize input context to reduce token count without losing conversation structure.  # noqa
     Strategies:
     1. Strip reasoning content from older messages (keep only recent 6 reasoning blocks)
-    2. Truncate overly long tool outputs (keep first/last 1500 chars for old ones)
+    2. Tiered tool output truncation: recent 5 keep 8000, older ones keep 1200
+    3. Truncate old message text: old user msgs at 6000, old assistant msgs at 1200
     """
     import os
 
@@ -5399,18 +6360,53 @@ def _optimize_input_context(body: dict[str, Any]) -> dict[str, Any]:
             if item.get("content"):
                 item["content"] = []
 
-    # Truncate long tool outputs (older than last 10 items)
-    MAX_OUTPUT_LEN = 3000
-    if item_count > 10:
-        for item in input_items[:-10]:
-            if isinstance(item, dict):
-                _truncate_tool_output(item, MAX_OUTPUT_LEN)
-                # Also handle nested content arrays
-                content = item.get("content")
-                if isinstance(content, list):
-                    for sub in content:
-                        if isinstance(sub, dict):
-                            _truncate_tool_output(sub, MAX_OUTPUT_LEN)
+    # --- Tiered compression (mirrors DeepSeek's proven strategy) ---
+    # Identify recent tool output indices (last 5 keep more context)
+    tool_output_indices = [
+        i for i, item in enumerate(input_items)
+        if isinstance(item, dict)
+        and item.get("type") in {"function_call_output", "custom_tool_call_output"}
+    ]
+    recent_tool_output_set = set(tool_output_indices[-5:])
+
+    # Identify recent message indices (last 10 are "current turn")
+    recent_offset = max(0, item_count - 10)
+
+    for idx, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        is_recent = idx >= recent_offset
+
+        # Tiered tool output truncation
+        if item.get("type") in {"function_call_output", "custom_tool_call_output"}:
+            max_len = 8_000 if idx in recent_tool_output_set else 1_200
+            _truncate_tool_output(item, max_len)
+            content = item.get("content")
+            if isinstance(content, list):
+                for sub in content:
+                    if isinstance(sub, dict):
+                        _truncate_tool_output(sub, max_len)
+            continue
+
+        # Truncate old message text to keep context window lean
+        if not is_recent:
+            role = item.get("role") or ""
+            content = item.get("content")
+            if isinstance(content, str) and content:
+                if role == "user" and len(content) > 6_000:
+                    item["content"] = _clip_text_middle(content, 6_000)
+                elif role == "assistant" and len(content) > 1_200:
+                    item["content"] = _clip_text_middle(content, 1_200)
+            elif isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    for key in ("text", "input_text"):
+                        val = part.get(key)
+                        if isinstance(val, str) and val:
+                            limit = 6_000 if role == "user" else 1_200
+                            if len(val) > limit:
+                                part[key] = _clip_text_middle(val, limit)
 
     return body
 

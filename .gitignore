@@ -1,6 +1,8 @@
 # Generated runtime + user state
 .codex-shim/
 .deepseek-web-data/
+.kimi-web-data/
+.grok-web-data/
 vendor/deepseek-web-api/node_modules/
 *.log
 *.pid
