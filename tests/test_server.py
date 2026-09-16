@@ -10,7 +10,9 @@ from codex_shim import server as server_module
 from codex_shim.server import (
     CLAUDE_EXECUTION_RULES,
     CLAUDE_LOOP_BREAK_TOOL_THRESHOLD,
+    CODEGRAPH_FIRST_RULES,
     DEEPSEEK_EXECUTION_RULES,
+    KIMI_HARD_STOP_TOOL_THRESHOLD,
     PICKER_TOKEN_HEADER,
     ResponsesStreamState,
     ShimServer,
@@ -23,7 +25,12 @@ from codex_shim.server import (
     _current_managed_model,
     _deepseek_codegraph_project_hint,
     _deepseek_stream_failure,
+    _estimate_kimi_tokens,
+    _expand_deepseek_namespace_tools,
+    _is_claude_tool_pairing_error,
+    _repair_claude_tool_rounds,
     _is_deepseek_internal_result_text,
+    _kimi_current_turn_tool_call_count,
     _normalize_apply_patch_input,
     _picker_html,
     _prime_loopback_platform,
@@ -92,6 +99,28 @@ def test_configured_claude_gateway_model_prefers_env(monkeypatch):
 def test_configured_claude_gateway_model_falls_back_to_default(monkeypatch):
     monkeypatch.delenv("CLAUDE_GATEWAY_MODEL", raising=False)
     assert _configured_claude_gateway_model() == "claude-sonnet-4.6"
+
+
+def test_kimi_current_turn_tool_call_count_ignores_previous_turns():
+    body = {
+        "input": [
+            {"type": "message", "role": "user", "content": "old turn"},
+            {"type": "function_call", "call_id": "old", "name": "exec", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "old", "output": "done"},
+            {"type": "message", "role": "user", "content": "new turn"},
+            {"type": "function_call", "call_id": "new-1", "name": "exec", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "new-1", "output": "done"},
+            {"type": "custom_tool_call", "call_id": "new-2", "name": "patch", "input": "x"},
+        ]
+    }
+
+    assert _kimi_current_turn_tool_call_count(body) == 2
+
+
+def test_estimate_kimi_tokens_never_returns_zero_for_content():
+    assert _estimate_kimi_tokens("") > 0
+    assert _estimate_kimi_tokens("hello") > 0
+    assert _estimate_kimi_tokens({"content": "中文内容"}) > 0
 
 
 def test_prime_routing_identity_rejects_non_loopback_peer():
@@ -371,6 +400,145 @@ def test_deepseek_malformed_tool_call_detection_is_case_insensitive():
     assert not shim._is_malformed_tool_call("normal response")
 
 
+def test_repair_claude_tool_rounds_moves_results_and_drops_dangling_items():
+    chat_body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "first", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_b",
+                        "type": "function",
+                        "function": {"name": "second", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "user", "content": "steering message"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "b result"},
+            {"role": "tool", "tool_call_id": "call_a", "content": "a result"},
+            {"role": "tool", "tool_call_id": "orphan", "content": "orphan"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_missing",
+                        "type": "function",
+                        "function": {"name": "missing", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+    }
+
+    stats = _repair_claude_tool_rounds(chat_body)
+
+    assert [message["role"] for message in chat_body["messages"]] == [
+        "assistant",
+        "tool",
+        "tool",
+        "user",
+    ]
+    assert [
+        message.get("tool_call_id")
+        for message in chat_body["messages"][1:3]
+    ] == ["call_a", "call_b"]
+    assert stats == {
+        "paired": 2,
+        "dropped_calls": 1,
+        "dropped_results": 1,
+        "moved_results": 1,
+    }
+
+
+def test_claude_tool_pairing_error_detection():
+    assert _is_claude_tool_pairing_error(
+        "tool_use ids were found without tool_result blocks immediately after"
+    )
+    assert not _is_claude_tool_pairing_error("Token expired")
+
+
+@pytest.mark.asyncio
+async def test_claude_gateway_retries_tool_pairing_400_without_tool_history(
+    monkeypatch,
+):
+    requests: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, status, text):
+            self.status = status
+            self._text = text
+
+        async def text(self):
+            return self._text
+
+        def release(self):
+            pass
+
+    class FakeSession:
+        async def post(self, url, **kwargs):
+            requests.append(json.loads(json.dumps(kwargs["json"])))
+            if len(requests) == 1:
+                return FakeResponse(
+                    400,
+                    "tool_use ids were found without tool_result blocks "
+                    "immediately after",
+                )
+            return FakeResponse(503, "test stop")
+
+    shim = ShimServer()
+
+    async def fake_get_session():
+        return FakeSession()
+
+    monkeypatch.setattr(shim, "_get_session", fake_get_session)
+    result = await shim._claude_gateway_fallback(
+        None,
+        {
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_a",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"pwd"}',
+                },
+                {"type": "message", "role": "user", "content": "continue"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_a",
+                    "output": "ok",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert result is None
+    assert len(requests) == 2
+    first_roles = [message["role"] for message in requests[0]["messages"]]
+    assert first_roles[-3:] == ["assistant", "tool", "user"]
+    assert not any(
+        message.get("role") == "tool" or message.get("tool_calls")
+        for message in requests[1]["messages"]
+    )
+
+
 def test_platform_prefix_uses_newest_prefixed_user_message():
     body = {
         "input": [
@@ -569,6 +737,52 @@ def test_deepseek_hydrates_codegraph_namespace_with_project_hint(tmp_path):
     assert codegraph["parameters"]["required"] == ["query", "projectPath"]
     assert codegraph["parameters"]["properties"]["projectPath"]["default"] == str(project)
     assert str(project) in codegraph["description"]
+    assert CODEGRAPH_FIRST_RULES in sanitized["instructions"]
+    assert f"Indexed projectPath for this task: {project}" in sanitized["instructions"]
+
+
+def test_codegraph_project_hint_walks_up_from_nested_file(tmp_path):
+    project = tmp_path / "front"
+    nested_file = project / "src/common/views/newmobile/editProfile.vue"
+    nested_file.parent.mkdir(parents=True)
+    nested_file.write_text("<template />")
+    (project / ".codegraph").mkdir()
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": f"检查代码 {nested_file} 中的问题",
+            }
+        ]
+    }
+
+    assert _deepseek_codegraph_project_hint(body) == str(project)
+
+
+def test_kimi_expands_codegraph_namespace_with_project_hint(tmp_path):
+    project = tmp_path / "front"
+    (project / ".codegraph").mkdir(parents=True)
+    tools = [
+        {
+            "type": "function",
+            "name": "exec_command",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        },
+        {"type": "namespace", "name": "mcp__codegraph__", "description": "code"},
+    ]
+
+    expanded = _expand_deepseek_namespace_tools(tools, str(project))
+    codegraph = next(
+        tool for tool in expanded if tool.get("name") == "codegraph_explore"
+    )
+
+    assert all(tool.get("type") != "namespace" for tool in expanded)
+    assert codegraph["parameters"]["required"] == ["query", "projectPath"]
+    assert codegraph["parameters"]["properties"]["projectPath"]["default"] == str(project)
 
 
 def test_deepseek_rewrites_virtual_codegraph_call_to_exec_command():
@@ -1501,6 +1715,122 @@ def _named_sse_events(text: str) -> list[tuple[str | None, dict]]:
         if data and data != "[DONE]":
             events.append((event_name, json.loads(data)))
     return events
+
+
+async def test_kimi_hard_stop_finishes_locally_without_upstream_request(tmp_path, monkeypatch):
+    shim = ShimServer(_picker_settings_file(tmp_path))
+
+    class UnexpectedClientSession:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("Kimi upstream must not be called after the hard limit")
+
+    monkeypatch.setattr(server_module, "ClientSession", UnexpectedClientSession)
+
+    body = {
+        "model": "kimi-k3",
+        "stream": True,
+        "input": [{"type": "message", "role": "user", "content": "investigate"}],
+    }
+    for index in range(KIMI_HARD_STOP_TOOL_THRESHOLD):
+        call_id = f"call-{index}"
+        body["input"].extend([
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "exec_command",
+                "arguments": json.dumps({"cmd": "true"}),
+            },
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "ok",
+            },
+        ])
+
+    async def handler(request):
+        return await shim._kimi_api_passthrough(
+            request,
+            body,
+            model="kimi-for-coding",
+            source_tag="[kimi-k3]",
+        )
+
+    app = web.Application()
+    app.router.add_post("/test", handler)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        resp = await client.post("/test")
+        assert resp.status == 200
+        assert resp.headers["X-Codex-Shim-Usage-Estimated"] == "true"
+        events = _sse_events(await resp.text())
+        completed = [event for event in events if event.get("type") == "response.completed"]
+        assert len(completed) == 1
+        response = completed[0]["response"]
+        assert response["status"] == "completed"
+        assert response["usage"]["total_tokens"] > 0
+        assert "已强制停止继续调用" in response["output"][0]["content"][0]["text"]
+        assert str(KIMI_HARD_STOP_TOOL_THRESHOLD) in response["output"][0]["content"][0]["text"]
+    finally:
+        await client.close()
+
+
+async def test_kimi_non_streaming_estimates_usage_when_upstream_omits_it(
+    tmp_path,
+    monkeypatch,
+):
+    async def kimi_chat(request):
+        await request.json()
+        return web.json_response({
+            "id": "kimi-test",
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+        })
+
+    upstream = web.Application()
+    upstream.router.add_post("/chat/completions", kimi_chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim = ShimServer(_picker_settings_file(tmp_path))
+    monkeypatch.setattr(
+        server_module,
+        "KIMI_API_BASE",
+        str(upstream_client.make_url("/chat/completions")),
+    )
+    monkeypatch.setattr(server_module, "_get_kimi_api_key", lambda: "test-key")
+
+    body = {
+        "model": "kimi-for-coding",
+        "stream": False,
+        "input": [{"type": "message", "role": "user", "content": "check this"}],
+    }
+
+    async def handler(request):
+        return await shim._kimi_api_passthrough(
+            request,
+            body,
+            model="kimi-for-coding",
+            source_tag="[kimi-k3]",
+        )
+
+    app = web.Application()
+    app.router.add_post("/test", handler)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        resp = await client.post("/test")
+        assert resp.status == 200
+        assert resp.headers["X-Codex-Shim-Usage-Estimated"] == "true"
+        payload = await resp.json()
+        assert payload["status"] == "completed"
+        assert payload["usage"]["input_tokens"] > 0
+        assert payload["usage"]["output_tokens"] > 0
+        assert payload["usage"]["total_tokens"] == (
+            payload["usage"]["input_tokens"] + payload["usage"]["output_tokens"]
+        )
+    finally:
+        await client.close()
+        await upstream_client.close()
 
 
 async def test_streaming_openai_chat_response_completed_includes_usage(tmp_path):

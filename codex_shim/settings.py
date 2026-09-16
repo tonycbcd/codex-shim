@@ -17,22 +17,17 @@ DEFAULT_PORT = 8765
 PROVIDER_NAME = "codex_shim"
 CHATGPT_MODEL_SLUG = "gpt-5.6-sol"
 FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
+    "gpt-6-astra",
     "gpt-5.6-sol",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.2",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "codex-auto-review",
 )
 FALLBACK_CHATGPT_DISPLAY_NAMES = {
-    "gpt-5.5": "GPT-5.5",
-    "gpt-5.4": "gpt-5.4",
-    "gpt-5.4-mini": "GPT-5.4-Mini",
-    "gpt-5.3-codex": "gpt-5.3-codex",
-    "gpt-5.3-codex-spark": "GPT-5.3-Codex-Spark",
-    "gpt-5.2": "gpt-5.2",
+    "gpt-6-astra": "GPT-6 Astra",
+    "gpt-5.6-sol": "GPT-5.6",
+    "gpt-5.6-terra": "GPT-5.6-Terra",
+    "gpt-5.6-luna": "GPT-5.6-Luna",
     "codex-auto-review": "Codex Auto Review",
 }
 

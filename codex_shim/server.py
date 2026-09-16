@@ -90,6 +90,9 @@ KIMI_MODEL_K3  = "kimi-k3"
 KIMI_API_BASE   = "https://api.kimi.com/coding/v1/chat/completions"
 KIMI_API_KEY_FILE = Path(__file__).resolve().parents[1] / ".kimi-web-data" / ".api-key"
 KIMI_API_MODEL  = "kimi-for-coding"
+KIMI_FINISH_GUIDANCE_TOOL_THRESHOLD = 12
+KIMI_HARD_STOP_TOOL_THRESHOLD = 16
+KIMI_MAX_ESTIMATED_INPUT_TOKENS = 400_000
 
 def _get_kimi_api_key() -> str:
     """Read Kimi official API key from .kimi-web-data/.api-key."""
@@ -202,6 +205,14 @@ CLAUDE_PATCH_FAILURE_RULES = """Claude apply_patch recovery:
 - Do not repeat the same patch syntax. Use only the exact Codex patch grammar described above.
 - If two apply_patch attempts have already failed, stop using apply_patch for this turn. Use one focused exec_command edit, then inspect git diff and run the relevant syntax check."""
 
+CODEGRAPH_FIRST_RULES = """CodeGraph-first repository exploration:
+- This task targets an indexed repository. Your FIRST code-location or architecture action MUST use the codegraph_explore function.
+- Do not start with exec_command, grep, rg, find, sed, cat, ls, or broad file reads when locating code that CodeGraph can answer.
+- Call codegraph_explore with the exact projectPath supplied below and a focused query containing the relevant file, symbols, and code-flow question.
+- Treat source returned by CodeGraph as already read. Do not immediately re-read the same files with shell commands.
+- After the CodeGraph result, use only focused follow-up reads, edits, and tests.
+- If codegraph_explore is unavailable or fails, use exec_command with `codegraph explore "<focused query>"` in the indexed project. Fall back to grep/find only after that also fails."""
+
 DEEPSEEK_EXECUTION_RULES = """DeepSeek Codex execution contract:
 - Treat requests to modify, fix, implement, create, or refactor code as execution tasks, not explanation-only tasks. Keep using tools until the requested change is applied or a concrete blocker is proven.
 - Before editing, confirm the current workdir/repository, inspect git status, and verify the target file exists. Current tool output is the source of truth; never reuse a path, branch, file, or diff from an earlier workspace without checking it again.
@@ -302,6 +313,43 @@ def _claude_current_turn_tool_call_count(body: dict[str, Any]) -> int:
     )
 
 
+def _kimi_current_turn_tool_call_count(body: dict[str, Any]) -> int:
+    """Count tool calls after the latest real user message in this turn."""
+    inputs = body.get("input")
+    if not isinstance(inputs, list):
+        return 0
+
+    latest_user_index = -1
+    for index, item in enumerate(inputs):
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") == "user" and item.get("type") in {None, "message"}:
+            latest_user_index = index
+
+    return sum(
+        1
+        for item in inputs[latest_user_index + 1 :]
+        if isinstance(item, dict)
+        and item.get("type") in {"function_call", "custom_tool_call", "computer_call"}
+    )
+
+
+def _estimate_kimi_tokens(value: Any) -> int:
+    """Conservative local fallback when Kimi omits usage in its response.
+
+    Uses JSON serialization bytes / 4, which overestimates by ~3x for
+    code-heavy sessions but is safe and predictable. KIMI_MAX_ESTIMATED_INPUT_TOKENS
+    is set 3x above Kimi's actual context window to compensate.
+    """
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(value)
+    if not serialized:
+        return 0
+    return max(1, (len(serialized.encode("utf-8")) + 3) // 4)
+
+
 def _claude_current_turn_failed_patch_count(body: dict[str, Any]) -> int:
     inputs = body.get("input")
     if not isinstance(inputs, list):
@@ -369,6 +417,98 @@ def _add_claude_execution_guidance(
         chat_body["messages"] = messages
     messages.insert(0, {"role": "system", "content": guidance})
     return tool_count
+
+
+def _repair_claude_tool_rounds(
+    chat_body: dict[str, Any],
+    *,
+    strip_all_tool_history: bool = False,
+) -> dict[str, int]:
+    """Make historical Chat Completions tool rounds valid for Kiro/Bedrock.
+
+    Codex can place a steering/user message between a function call and its
+    output, and context compaction can leave either side dangling. Bedrock
+    requires every assistant tool call to be followed immediately by its tool
+    results. Rebuild the history around matched call IDs before forwarding.
+    """
+    messages = chat_body.get("messages")
+    stats = {
+        "paired": 0,
+        "dropped_calls": 0,
+        "dropped_results": 0,
+        "moved_results": 0,
+    }
+    if not isinstance(messages, list):
+        return stats
+
+    results_by_id: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    total_results = 0
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        total_results += 1
+        call_id = str(message.get("tool_call_id") or "").strip()
+        if call_id:
+            results_by_id.setdefault(call_id, []).append((index, message))
+
+    rebuilt: list[dict[str, Any]] = []
+    consumed_results = 0
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            continue
+
+        calls = message.get("tool_calls")
+        if message.get("role") != "assistant" or not isinstance(calls, list):
+            rebuilt.append(message)
+            continue
+
+        kept_calls: list[dict[str, Any]] = []
+        paired_results: list[tuple[int, dict[str, Any]]] = []
+        for call in calls:
+            if not isinstance(call, dict):
+                stats["dropped_calls"] += 1
+                continue
+            call_id = str(call.get("id") or "").strip()
+            matches = results_by_id.get(call_id) or []
+            if strip_all_tool_history or not matches:
+                stats["dropped_calls"] += 1
+                continue
+            result_index, result_message = matches.pop(0)
+            kept_calls.append(call)
+            paired_results.append((result_index, result_message))
+            consumed_results += 1
+            stats["paired"] += 1
+            if result_index != index + len(paired_results):
+                stats["moved_results"] += 1
+
+        cleaned_assistant = dict(message)
+        if kept_calls:
+            cleaned_assistant["tool_calls"] = kept_calls
+            rebuilt.append(cleaned_assistant)
+            rebuilt.extend(result for _, result in paired_results)
+            continue
+
+        cleaned_assistant.pop("tool_calls", None)
+        content = cleaned_assistant.get("content")
+        if isinstance(content, str) and content.strip():
+            rebuilt.append(cleaned_assistant)
+        elif isinstance(content, list) and content:
+            rebuilt.append(cleaned_assistant)
+
+    stats["dropped_results"] = total_results - consumed_results
+    chat_body["messages"] = rebuilt
+    return stats
+
+
+def _is_claude_tool_pairing_error(error_text: str) -> bool:
+    lowered = (error_text or "").lower()
+    return (
+        "tool_use ids were found without tool_result" in lowered
+        or "tool_result" in lowered
+        and "immediately after" in lowered
+    )
 
 
 def _add_claude_execution_guidance_anthropic(
@@ -1182,6 +1322,7 @@ class ShimServer:
     async def responses(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         _log_incoming_request("/v1/responses", body)
+        print(f"[DEBUG] responses() called, model={body.get('model')}, session_id={request.headers.get('session_id','')}", flush=True)
         body = await self._maybe_apply_auto_router(body)
         # Prefer an explicit prefix in the newest user message. The patched
         # Codex client may instead send the same choice as first_platform.
@@ -1256,7 +1397,9 @@ class ShimServer:
                         upstream_model=chatgpt_upstream_model(model),
                     )
                 else:
-                    print("[shim] ⚠️  ChatGPT not available, falling back to Claude", flush=True)
+                    raise web.HTTPServiceUnavailable(
+                        text=f"ChatGPT passthrough unavailable; explicit [{platform}] requests will not be rerouted"
+                    )
             elif platform in {"claud", "claude", "kiro"}:
                 pass
             else:
@@ -1352,7 +1495,9 @@ class ShimServer:
             upstream = chatgpt_upstream_model(model)
             return await self._chatgpt_compact_passthrough(request, body, upstream_model=upstream)
         if platform == "chatgpt" or str(platform).startswith("chatgpt-"):
-            print("[shim] ChatGPT compact unavailable; using default Claude gateway", flush=True)
+            raise web.HTTPServiceUnavailable(
+                text=f"ChatGPT passthrough unavailable; explicit [{platform}] compact requests will not be rerouted"
+            )
         elif platform in BEDROCK_OPUS_PLATFORMS:
             bedrock_model_id, bedrock_source_tag = BEDROCK_OPUS_PLATFORMS[platform]
             route = self._route_bedrock_opus(bedrock_model_id)
@@ -1735,7 +1880,10 @@ class ShimServer:
         # default remains a capacity fallback for compatible requests.
         # Fallback models will be added dynamically if "at capacity" error is detected
         models_to_try = [original_client_model]
-        if CHATGPT_MODEL_SLUG != original_client_model:
+        # Only add the default model as a capacity fallback when the caller did
+        # NOT explicitly pin a model (upstream_model is None).  When the user
+        # specifies e.g. [chatgpt-5.4], we must NOT silently fall back to 5.6.
+        if CHATGPT_MODEL_SLUG != original_client_model and upstream_model is None:
             models_to_try.append(CHATGPT_MODEL_SLUG)
         capacity_fallbacks_added = False
 
@@ -1808,6 +1956,19 @@ class ShimServer:
                             if fb_model not in models_to_try:
                                 models_to_try.append(fb_model)
                         print(f"[shim] Model at capacity, added fallbacks: {models_to_try}", flush=True)
+                    # Hard error: model not supported for this account — do not silently reroute
+                    elif upstream_model is not None and (
+                        "not supported" in err_text.lower()
+                        or "model is not supported" in err_text.lower()
+                    ):
+                        print(f"[shim] ⛔ Model {try_model!r} not supported for this account — raising error", flush=True)
+                        _err_payload = json.dumps({
+                            "type": "error",
+                            "error": {"message": err_text[:300], "type": "model_not_supported"}
+                        })
+                        await _safe_write(response, f"data: {_err_payload}\n\n".encode("utf-8"))
+                        await response.write_eof()
+                        return response
                     model_failed = True
                     break
                 break
@@ -2756,6 +2917,91 @@ class ShimServer:
 
     # ── Kimi official API passthrough (kimi-k2.7) ───────────────────────────────
 
+    async def _kimi_budget_stop_response(
+        self,
+        request: web.Request,
+        *,
+        wants_stream: bool,
+        source_tag: str,
+        model: str,
+        reason: str,
+        input_tokens: int,
+    ) -> web.StreamResponse:
+        """Finish locally instead of making another paid Kimi request."""
+        resp_id = f"kimi-budget-{uuid.uuid4().hex[:12]}"
+        text = (
+            f"{source_tag} 已达到本轮 Kimi 安全预算，codex-shim 已强制停止继续调用，"
+            f"以避免继续消耗配额。{reason}"
+        )
+        usage = {
+            "input_tokens": max(0, input_tokens),
+            "output_tokens": _estimate_kimi_tokens(text),
+        }
+        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+        output = [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        }]
+
+        if not wants_stream:
+            return web.json_response(
+                {
+                    "id": resp_id,
+                    "object": "response",
+                    "model": model,
+                    "status": "completed",
+                    "output": output,
+                    "usage": usage,
+                },
+                headers={"X-Codex-Shim-Usage-Estimated": "true"},
+            )
+
+        response = _sse_response()
+        response.headers["X-Codex-Shim-Usage-Estimated"] = "true"
+        try:
+            await response.prepare(request)
+            events = [
+                {"type": "response.created", "response": {
+                    "id": resp_id, "object": "response", "model": model,
+                    "status": "in_progress", "output": [],
+                }},
+                {"type": "response.output_item.added", "output_index": 0,
+                 "item": {"type": "message", "role": "assistant", "content": []}},
+                {"type": "response.content_part.added", "output_index": 0,
+                 "content_index": 0, "part": {"type": "output_text", "text": ""}},
+                {"type": "response.output_text.delta", "output_index": 0,
+                 "content_index": 0, "delta": text},
+                {"type": "response.output_text.done", "output_index": 0,
+                 "content_index": 0, "text": text},
+                {"type": "response.content_part.done", "output_index": 0,
+                 "content_index": 0, "part": {"type": "output_text", "text": text}},
+                {"type": "response.output_item.done", "output_index": 0,
+                 "item": output[0]},
+                {"type": "response.completed", "response": {
+                    "id": resp_id, "object": "response", "model": model,
+                    "status": "completed", "output": output, "usage": usage,
+                }},
+            ]
+            for event in events:
+                await _write_sse(response, event)
+        except ClientDisconnected:
+            pass
+        except (ConnectionResetError, ConnectionError):
+            pass
+        except Exception as exc:
+            if exc.__class__.__name__ not in {
+                "ClientConnectionResetError",
+                "ClientConnectionError",
+                "ClientPayloadError",
+            }:
+                raise
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
+
     async def _kimi_api_passthrough(
         self,
         request: web.Request,
@@ -2773,37 +3019,35 @@ class ShimServer:
         wants_stream = body.get("stream", True)
         resp_id = f"kimi-{uuid.uuid4().hex[:12]}"
 
-        # Convert Responses API → chat/completions format
-        chat_body = responses_to_chat(body, model)
+        # Convert Responses API → chat/completions format. Kimi does not
+        # reliably understand Codex namespace tools, so expose CodeGraph as a
+        # concrete function and explicitly require it for indexed projects.
+        forwarded_body = json.loads(json.dumps(body))
+        project_hint = _deepseek_codegraph_project_hint(body)
+        tools = forwarded_body.get("tools")
+        if isinstance(tools, list):
+            forwarded_body["tools"] = _expand_deepseek_namespace_tools(
+                tools,
+                project_hint,
+            )
+        if project_hint:
+            existing_instructions = forwarded_body.get("instructions")
+            guidance = _codegraph_first_guidance(project_hint, "Kimi")
+            forwarded_body["instructions"] = (
+                f"{existing_instructions}\n\n{guidance}"
+                if isinstance(existing_instructions, str)
+                and existing_instructions.strip()
+                else guidance
+            )
+            print(
+                f"[shim] Kimi CodeGraph-first enabled project={project_hint}",
+                flush=True,
+            )
+        chat_body = responses_to_chat(forwarded_body, model)
         chat_body["stream"] = wants_stream
 
-        # Loop-breaking: count tool calls in history and inject finish guidance
-        _kimi_tool_count = sum(
-            1 for item in (body.get("input") or [])
-            if isinstance(item, dict) and item.get("type") in {"function_call", "custom_tool_call"}
-        )
-        if _kimi_tool_count >= 30:
-            # Hard stop: strip tools so Kimi is forced to produce a text answer
-            chat_body.pop("tools", None)
-            chat_body.pop("tool_choice", None)
-            print(f"[shim] kimi-k3 hard-stop: {_kimi_tool_count} tool calls — tools stripped", flush=True)
-        elif _kimi_tool_count >= 12:
-            # Inject finish guidance into system message
-            _finish_hint = (
-                f"\n\nKimi finish-now: This turn has already used {_kimi_tool_count} tool calls. "
-                "Stop broad exploration. Either make the minimal needed edit now or report the exact "
-                "blocker in one sentence. Do not read more files or run more searches unless the next "
-                "edit is impossible without that specific information."
-            )
-            _msgs = chat_body.get("messages") or []
-            if _msgs and _msgs[0].get("role") == "system":
-                _msgs[0]["content"] = (_msgs[0].get("content") or "") + _finish_hint
-            elif _msgs:
-                _msgs.insert(0, {"role": "system", "content": _finish_hint})
-            print(f"[shim] kimi-k3 finish-guidance injected: {_kimi_tool_count} tool calls", flush=True)
-
-        # Sanitize messages: Kimi/Moonshot 400 when:
-
+        # Pre-compute estimated tokens for usage fallback (when Kimi omits usage)
+        _estimated_input_tokens = _estimate_kimi_tokens(chat_body)
 
         # Sanitize messages: Kimi/Moonshot 400 when:
         # 1. assistant tool_calls not immediately followed by tool results
@@ -2962,6 +3206,7 @@ class ShimServer:
         }
 
         session = ClientSession(timeout=ClientTimeout(total=300, connect=15))
+        downstream: web.StreamResponse | None = None
         try:
             resp = await session.post(KIMI_API_BASE, json=chat_body, headers=headers)
             if resp.status >= 400:
@@ -2970,7 +3215,7 @@ class ShimServer:
 
             if not wants_stream:
                 data = await resp.json(content_type=None)
-                usage = data.get("usage", {})
+                usage = data.get("usage") or {}
                 output = []
                 text_tagged = False
                 for choice in data.get("choices", []):
@@ -2999,17 +3244,36 @@ class ShimServer:
                 if not output:
                     output.append({"type": "message", "role": "assistant",
                                    "content": [{"type": "output_text", "text": source_tag}]})
+                input_tokens = int(usage.get("prompt_tokens") or 0)
+                output_tokens = int(usage.get("completion_tokens") or 0)
+                usage_estimated = input_tokens <= 0 or output_tokens <= 0
+                if input_tokens <= 0:
+                    input_tokens = _estimated_input_tokens
+                if output_tokens <= 0:
+                    output_tokens = _estimate_kimi_tokens(output)
+                total_tokens = int(usage.get("total_tokens") or 0)
+                if total_tokens <= 0:
+                    total_tokens = input_tokens + output_tokens
+                response_headers = {}
+                if usage_estimated:
+                    response_headers["X-Codex-Shim-Usage-Estimated"] = "true"
+                    print(
+                        f"[shim] Kimi usage missing; estimated input={input_tokens} "
+                        f"output={output_tokens}",
+                        flush=True,
+                    )
                 return web.json_response({
                     "id": data.get("id", resp_id),
                     "object": "response",
                     "model": KIMI_API_MODEL,
+                    "status": "completed",
                     "output": output,
                     "usage": {
-                        "input_tokens": usage.get("prompt_tokens", 0),
-                        "output_tokens": usage.get("completion_tokens", 0),
-                        "total_tokens": usage.get("total_tokens", 0),
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": total_tokens,
                     },
-                })
+                }, headers=response_headers)
 
             # Streaming: emit full Responses API envelope
             downstream = web.StreamResponse(
@@ -3023,9 +3287,7 @@ class ShimServer:
             await downstream.prepare(request)
 
             async def _emit(obj: dict) -> None:
-                await downstream.write(
-                    f"data: {_json.dumps(obj)}\n\n".encode("utf-8")
-                )
+                await _write_sse(downstream, obj)
 
             # Emit required envelope events so Codex client can start rendering
             await _emit({"type": "response.created", "response": {
@@ -3154,6 +3416,18 @@ class ShimServer:
                                      "name": tc["name"],
                                      "arguments": tc["arguments_buf"]})
 
+            usage_estimated = input_tokens <= 0 or output_tokens <= 0
+            if input_tokens <= 0:
+                input_tokens = _estimated_input_tokens
+            if output_tokens <= 0:
+                output_tokens = _estimate_kimi_tokens(final_output)
+            if usage_estimated:
+                print(
+                    f"[shim] Kimi streaming usage missing; estimated input={input_tokens} "
+                    f"output={output_tokens}",
+                    flush=True,
+                )
+
             await _emit({"type": "response.completed", "response": {
                 "id": resp_id, "object": "response", "model": KIMI_API_MODEL,
                 "status": "completed",
@@ -3161,8 +3435,23 @@ class ShimServer:
                 "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
                           "total_tokens": input_tokens + output_tokens},
             }})
-            await downstream.write_eof()
+            try:
+                await downstream.write_eof()
+            except Exception:
+                pass
             return downstream
+        except ClientDisconnected:
+            return downstream if downstream is not None else web.Response(status=499)
+        except (ConnectionResetError, ConnectionError):
+            return downstream if downstream is not None else web.Response(status=499)
+        except Exception as exc:
+            if exc.__class__.__name__ in {
+                "ClientConnectionResetError",
+                "ClientConnectionError",
+                "ClientPayloadError",
+            }:
+                return downstream if downstream is not None else web.Response(status=499)
+            raise
         finally:
             await session.close()
 
@@ -3942,6 +4231,16 @@ class ShimServer:
 
         chat_body = responses_to_chat(body, claude_model)
         claude_tool_count = _add_claude_execution_guidance(chat_body, body)
+        repair_stats = _repair_claude_tool_rounds(chat_body)
+        if any(repair_stats.values()):
+            print(
+                "[shim] Claude tool history repaired "
+                f"paired={repair_stats['paired']} "
+                f"dropped_calls={repair_stats['dropped_calls']} "
+                f"dropped_results={repair_stats['dropped_results']} "
+                f"moved_results={repair_stats['moved_results']}",
+                flush=True,
+            )
         if claude_tool_count >= CLAUDE_LOOP_BREAK_TOOL_THRESHOLD:
             print(
                 f"[shim] Claude loop breaker injected after {claude_tool_count} tool calls",
@@ -4035,8 +4334,62 @@ class ShimServer:
             flush=True,
         )
 
+        err_text = ""
         if upstream.status >= 400:
             err_text = await upstream.text()
+            if upstream.status == 400 and _is_claude_tool_pairing_error(err_text):
+                upstream.release()
+                strict_stats = _repair_claude_tool_rounds(
+                    chat_body,
+                    strip_all_tool_history=True,
+                )
+                print(
+                    "[shim] Claude tool-pairing 400; retrying once without "
+                    "historical tool rounds "
+                    f"dropped_calls={strict_stats['dropped_calls']} "
+                    f"dropped_results={strict_stats['dropped_results']}",
+                    flush=True,
+                )
+                retry_started = time.time()
+                try:
+                    if request is None:
+                        upstream = await asyncio.wait_for(
+                            session.post(
+                                claude_url,
+                                json=chat_body,
+                                headers=headers,
+                            ),
+                            timeout=90,
+                        )
+                    else:
+                        upstream = await _await_with_sse_heartbeats(
+                            session.post(
+                                claude_url,
+                                json=chat_body,
+                                headers=headers,
+                            ),
+                            response,
+                            timeout=90,
+                        )
+                    print(
+                        f"[shim] CLAUDE gateway retry status={upstream.status} "
+                        f"elapsed={time.time()-retry_started:.2f}s "
+                        f"model={claude_model}",
+                        flush=True,
+                    )
+                    err_text = (
+                        await upstream.text()
+                        if upstream.status >= 400
+                        else ""
+                    )
+                except Exception as retry_error:
+                    print(
+                        f"[shim] Claude gateway retry failed: {retry_error}",
+                        flush=True,
+                    )
+                    err_text = str(retry_error)
+
+        if upstream.status >= 400:
             print(f"[shim] Claude gateway error: {err_text[:300]}", flush=True)
             if state_started:
                 visible_message = f"Claude 当前不可用：HTTP {upstream.status}。"
@@ -4328,7 +4681,9 @@ class ShimServer:
         # default remains a capacity fallback for compatible requests.
         # Fallback models will be added dynamically if "at capacity" error is detected
         models_to_try = [original_model]
-        if CHATGPT_MODEL_SLUG != original_model:
+        # Same pin-model guard as _chatgpt_passthrough: skip default fallback
+        # when the caller explicitly requested a specific model.
+        if CHATGPT_MODEL_SLUG != original_model and upstream_model is None:
             models_to_try.append(CHATGPT_MODEL_SLUG)
         capacity_fallbacks_added = False
 
@@ -5321,12 +5676,13 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
     - "chatgpt-5.4" for [chatgpt-5.4]
     - "chatgpt-5.5" for [chatgpt-5.5]
     - "chatgpt-5.6" for [chatgpt-5.6]
+    - "chatgpt-6" for [chatgpt-6]
     - "claude" for [claude], [claud], or [kiro]
     - None if no prefix found
     """
     import re
     prefix_pattern = re.compile(
-        r'^\s*\[(deepseek-pro|deepseek|chatgpt-5\.6|chatgpt-5\.5|chatgpt-5\.4|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro|kimi-k2\.7|kimi-k3|kimi|grok-4\.6|grok-build|grok)\]\s*',
+        r'^\s*\[(deepseek-pro|deepseek|chatgpt-6|chatgpt-5\.6|chatgpt-5\.5|chatgpt-5\.4|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro|kimi-k2\.7|kimi-k3|kimi|grok-4\.6|grok-build|grok)\]\s*',
         re.IGNORECASE,
     )
 
@@ -5433,11 +5789,13 @@ def _chatgpt_platform_upstream_model(platform: str | None) -> str | None:
     if normalized == "chatgpt":
         return CHATGPT_MODEL_SLUG
     if normalized == "chatgpt-5.4":
-        return "gpt-5.4"
+        return "gpt-5.6-sol"  # gpt-5.4/5.4-mini/5.5 all removed; redirect to 5.6-sol
     if normalized == "chatgpt-5.5":
-        return "gpt-5.5"
+        return "gpt-5.6-sol"  # gpt-5.5 removed; redirect to 5.6-sol
     if normalized == "chatgpt-5.6":
         return "gpt-5.6-sol"
+    if normalized == "chatgpt-6":
+        return "gpt-6-astra"
     return None
 
 
@@ -5729,6 +6087,13 @@ def _compact_deepseek_value(value: Any) -> Any:
 
 def _deepseek_codegraph_project_hint(body: dict[str, Any]) -> str | None:
     """Infer the intended indexed project from environment context and task text."""
+    def nearest_indexed_project(path: Path) -> Path | None:
+        candidate = path.parent if path.is_file() else path
+        for directory in (candidate, *candidate.parents):
+            if (directory / ".codegraph").is_dir():
+                return directory
+        return None
+
     texts = [
         _deepseek_item_text(item)
         for item in body.get("input") or []
@@ -5744,10 +6109,9 @@ def _deepseek_codegraph_project_hint(body: dict[str, Any]) -> str | None:
         path = Path(candidate)
         if path.name == ".codegraph":
             path = path.parent
-        if (path / ".codegraph").is_dir():
-            return str(path)
-        if path.is_file() and (path.parent / ".codegraph").is_dir():
-            return str(path.parent)
+        indexed_project = nearest_indexed_project(path)
+        if indexed_project is not None:
+            return str(indexed_project)
 
     project_names: list[str] = []
     for pattern in (
@@ -5758,8 +6122,9 @@ def _deepseek_codegraph_project_hint(body: dict[str, Any]) -> str | None:
 
     if cwd:
         cwd_path = Path(cwd)
-        if (cwd_path / ".codegraph").is_dir():
-            return str(cwd_path)
+        indexed_project = nearest_indexed_project(cwd_path)
+        if indexed_project is not None:
+            return str(indexed_project)
         for project_name in reversed(project_names):
             candidate = cwd_path / project_name
             if (candidate / ".codegraph").is_dir():
@@ -5772,6 +6137,14 @@ def _deepseek_codegraph_project_hint(body: dict[str, Any]) -> str | None:
         if len(indexed_children) == 1:
             return str(indexed_children[0])
     return None
+
+
+def _codegraph_first_guidance(project_hint: str, provider: str) -> str:
+    return (
+        f"{CODEGRAPH_FIRST_RULES}\n"
+        f"- Provider: {provider}.\n"
+        f"- Indexed projectPath for this task: {project_hint}"
+    )
 
 
 def _expand_deepseek_namespace_tools(
@@ -5821,6 +6194,11 @@ def _expand_deepseek_namespace_tools(
                                 "projectPath": {
                                     "type": "string",
                                     "description": "Absolute indexed project directory.",
+                                    **(
+                                        {"default": project_hint}
+                                        if project_hint
+                                        else {}
+                                    ),
                                 },
                                 "query": {
                                     "type": "string",
@@ -5831,7 +6209,7 @@ def _expand_deepseek_namespace_tools(
                                     "description": "Maximum source files to return.",
                                 },
                             },
-                            "required": ["query"],
+                            "required": ["query", "projectPath"],
                             "additionalProperties": False,
                         },
                     }
@@ -6126,12 +6504,17 @@ def _is_deepseek_continuation(text: str) -> bool:
 def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
     """Keep the current task/tool chain small enough for DeepSeek Web."""  # noqa: E501
     sanitized = json.loads(json.dumps(body))
+    project_hint = _deepseek_codegraph_project_hint(body)
     existing_instructions = sanitized.get("instructions")
     instruction_blocks = [
         f"{existing_instructions}\n\n{DEEPSEEK_EXECUTION_RULES}"
         if isinstance(existing_instructions, str) and existing_instructions.strip()
         else DEEPSEEK_EXECUTION_RULES
     ]
+    if project_hint:
+        instruction_blocks.append(
+            _codegraph_first_guidance(project_hint, "DeepSeek")
+        )
     input_items = sanitized.get("input")
     if not isinstance(input_items, list):
         sanitized["instructions"] = "\n\n".join(instruction_blocks)
@@ -6333,7 +6716,6 @@ def _sanitize_deepseek_body(body: dict[str, Any]) -> dict[str, Any]:
         # Keep native namespace tools intact. The vendored @codeproxy/core
         # adapter now owns namespace flattening, upstream-safe name
         # sanitization, and restoration in Responses events.
-        project_hint = _deepseek_codegraph_project_hint(body)
         hydrated_tools = _hydrate_deepseek_namespace_tools(
             relevant_tools,
             project_hint,
@@ -6536,6 +6918,24 @@ def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
                 output.append(sanitized)
         return output
     if isinstance(value, dict):
+        # ChatGPT Responses API requires all item IDs to start with "fc" prefix
+        # (fc_<hash>).  Codex/Claude sessions may carry IDs from other providers
+        # (e.g. tooluse_...) which cause a 400 "Invalid 'input[N].id'" error.
+        if "id" in value and isinstance(value.get("id"), str):
+            _item_id = value["id"]
+            _item_type = str(value.get("type") or "")
+            if _item_id.startswith("tooluse_"):
+                value["id"] = "fc_" + _item_id
+            elif _item_id.startswith("msg_"):
+                # message items: ChatGPT allows msg_ prefix but strips it to fc_
+                # to guarantee compatibility regardless of upstream naming.
+                value["id"] = "fc_" + _item_id[4:]
+            elif not _item_id.startswith("fc_") and _item_type in {
+                "function_call", "function_call_output",
+                "computer_call", "computer_call_output",
+                "custom_tool_call", "custom_tool_call_output",
+            }:
+                value["id"] = "fc_" + _item_id
         if value.get("type") == "reasoning" and _has_shim_encrypted_content(value):
             return _DROP_ITEM
         output = {}
