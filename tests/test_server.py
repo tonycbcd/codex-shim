@@ -592,6 +592,43 @@ def test_claude_prefix_aliases_switch_back_to_claude(prefix):
     assert stripped["input"][0]["content"] == "[chatgpt] old task"
 
 
+@pytest.mark.parametrize(
+    ("prefix", "expected"),
+    [
+        ("claude-4.5", "claude-4.5"),
+        ("kimi-2.7", "kimi-k2.7"),
+        ("kimi-3", "kimi-k3"),
+        ("chatgpt-5.6", "chatgpt-5.6"),
+        ("chatgpt-6", "chatgpt-6"),
+        ("deepseek", "deepseek"),
+        ("deepseek-pro", "deepseek-pro"),
+    ],
+)
+def test_requested_wechat_prefixes_are_supported(prefix, expected):
+    body = {"input": [{"role": "user", "content": f"[{prefix}] ping"}]}
+
+    stripped, platform = _check_and_strip_platform_prefix(body)
+
+    assert platform == expected
+    assert stripped["input"][0]["content"] == "ping"
+
+
+def test_batched_wechat_messages_use_the_last_explicit_prefix():
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": "[deepseek] 看上去还不错\n\n[chatgpt-5.6] Hi, what's your name ?",
+            }
+        ]
+    }
+
+    stripped, platform = _check_and_strip_platform_prefix(body)
+
+    assert platform == "chatgpt-5.6"
+    assert stripped["input"][0]["content"] == "看上去还不错\n\nHi, what's your name ?"
+
+
 def test_new_prefix_updates_remembered_session_platform():
     shim = ShimServer()
 
@@ -2016,6 +2053,35 @@ async def test_explicit_claude_platform_bypasses_stale_bedrock_model(monkeypatch
         assert captured["response_model_override"] == _configured_claude_gateway_model()
         assert isinstance(captured["body"], dict)
         assert captured["body"]["model"] == "us-anthropic-claude-opus-5"
+    finally:
+        await client.close()
+
+
+async def test_claude_45_prefix_selects_sonnet_45(monkeypatch, tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim = ShimServer(settings)
+    captured: dict[str, object] = {}
+
+    async def fake_gateway(request, body, **kwargs):
+        captured.update(kwargs)
+        return web.json_response({"ok": True})
+
+    monkeypatch.setattr(shim, "_claude_gateway_fallback", fake_gateway)
+
+    client = TestClient(TestServer(shim.app()))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.6-sol",
+                "stream": False,
+                "input": [{"role": "user", "content": "[claude-4.5] hi"}],
+            },
+        )
+        assert resp.status == 200
+        assert captured["upstream_model_override"] == "claude-sonnet-4.5"
     finally:
         await client.close()
 

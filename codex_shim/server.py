@@ -135,6 +135,9 @@ DEFAULT_CLAUDE_GATEWAY_URL = "http://127.0.0.1:8901/v1/chat/completions"
 # claude-opus-4.6 returns 400 "Invalid model ID or insufficient subscription
 # level" on this account, which is why default shim->Kiro requests failed.
 DEFAULT_CLAUDE_GATEWAY_MODEL = "claude-sonnet-4.6"
+CLAUDE_PREFIX_MODELS = {
+    "claude-4.5": "claude-sonnet-4.5",
+}
 
 
 def _configured_claude_gateway_model() -> str:
@@ -1400,7 +1403,7 @@ class ShimServer:
                     raise web.HTTPServiceUnavailable(
                         text=f"ChatGPT passthrough unavailable; explicit [{platform}] requests will not be rerouted"
                     )
-            elif platform in {"claud", "claude", "kiro"}:
+            elif platform in {"claud", "claude", "kiro", *CLAUDE_PREFIX_MODELS}:
                 pass
             else:
                 print(
@@ -1409,13 +1412,17 @@ class ShimServer:
                 )
 
         model = str(body.get("model") or "")
-        explicit_claude_platform = platform in {"claud", "claude", "kiro"}
+        explicit_claude_platform = platform in {"claud", "claude", "kiro", *CLAUDE_PREFIX_MODELS}
         if explicit_claude_platform:
             print("[shim] Routing request to default Claude gateway", flush=True)
+            claude_kwargs = {}
+            if platform in CLAUDE_PREFIX_MODELS:
+                claude_kwargs["upstream_model_override"] = CLAUDE_PREFIX_MODELS[platform]
             claude_result = await self._claude_gateway_fallback(
                 request,
                 body,
                 response_model_override=_configured_claude_gateway_model(),
+                **claude_kwargs,
             )
             if claude_result is not None:
                 return claude_result
@@ -4214,6 +4221,7 @@ class ShimServer:
         body: dict[str, Any],
         response_model_override: str | None = None,
         prepared_response: web.StreamResponse | None = None,
+        upstream_model_override: str | None = None,
     ) -> web.StreamResponse | None:
         """Fallback to Claude via kiro-gateway. Returns None if it fails."""
         claude_url = os.environ.get(
@@ -4224,7 +4232,7 @@ class ShimServer:
             "CLAUDE_GATEWAY_API_KEY",
             os.environ.get("CODEX_SHIM_FALLBACK_KEY", "my-super-secret-password-123"),
         )
-        claude_model = os.environ.get(
+        claude_model = upstream_model_override or os.environ.get(
             "CLAUDE_GATEWAY_MODEL",
             DEFAULT_CLAUDE_GATEWAY_MODEL,
         ).strip()
@@ -5678,12 +5686,15 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
     - "chatgpt-5.6" for [chatgpt-5.6]
     - "chatgpt-6" for [chatgpt-6]
     - "claude" for [claude], [claud], or [kiro]
+    - "claude-4.5" for [claude-4.5]
+    - "kimi-k2.7" for [kimi-k2.7] or [kimi-2.7]
+    - "kimi-k3" for [kimi-k3] or [kimi-3]
     - None if no prefix found
     """
     import re
     prefix_pattern = re.compile(
-        r'^\s*\[(deepseek-pro|deepseek|chatgpt-6|chatgpt-5\.6|chatgpt-5\.5|chatgpt-5\.4|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claud|kiro|kimi-k2\.7|kimi-k3|kimi|grok-4\.6|grok-build|grok)\]\s*',
-        re.IGNORECASE,
+        r'^[ \t]*\[(deepseek-pro|deepseek|chatgpt-6|chatgpt-5\.6|chatgpt-5\.5|chatgpt-5\.4|chatgpt|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude-4\.5|claude|claud|kiro|kimi-k2\.7|kimi-2\.7|kimi-k3|kimi-3|kimi|grok-4\.6|grok-build|grok)\][ \t]*',
+        re.IGNORECASE | re.MULTILINE,
     )
 
     def normalize_platform(value: str) -> str:
@@ -5691,20 +5702,18 @@ def _check_and_strip_platform_prefix(body: dict[str, Any]) -> tuple[dict[str, An
         # keep claude-opus-X variants as-is; normalize aliases
         if platform in {"claud", "kiro"}:
             return "claude"
-        if platform in {"kimi-k3"}:
+        if platform == "kimi-2.7":
+            return "kimi-k2.7"
+        if platform == "kimi-3":
             return "kimi-k3"
         return platform
 
     def strip_all_leading_prefixes(text: str) -> tuple[str, str | None]:
-        platform: str | None = None
-        current = text
-        while True:
-            match = prefix_pattern.match(current)
-            if not match:
-                return current.lstrip(), platform
-            if platform is None:
-                platform = normalize_platform(match.group(1))
-            current = current[match.end():]
+        matches = list(prefix_pattern.finditer(text))
+        if not matches:
+            return text.lstrip(), None
+        platform = normalize_platform(matches[-1].group(1))
+        return prefix_pattern.sub("", text).lstrip(), platform
 
     input_data = body.get("input")
     if not input_data:
@@ -5773,7 +5782,7 @@ def _strip_leading_source_tags(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
     prefix_pattern = re.compile(
-        r'^\s*\[(deepseek-pro|deepseek|chatgpt(?:-[^\]]+)?|chatgpt [^\]]+|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude|claude [^\]]+|claud|kiro)\]\s*',
+        r'^\s*\[(deepseek-pro|deepseek|chatgpt(?:-[^\]]+)?|chatgpt [^\]]+|claude-opus-5|claude-opus-4\.8|claude-opus-4\.7|claude-opus-4\.6|claude-4\.5|claude|claude [^\]]+|claud|kiro|kimi-k2\.7|kimi-2\.7|kimi-k3|kimi-3|kimi)\]\s*',
         re.IGNORECASE,
     )
     current = text
