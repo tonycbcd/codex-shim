@@ -10,6 +10,8 @@ from codex_shim import server as server_module
 from codex_shim.server import (
     CLAUDE_EXECUTION_RULES,
     CLAUDE_LOOP_BREAK_TOOL_THRESHOLD,
+    CLAUDE_REPEAT_TOOL_CALL_THRESHOLD,
+    ChatGPTPassthroughTerminalGuard,
     CODEGRAPH_FIRST_RULES,
     DEEPSEEK_EXECUTION_RULES,
     KIMI_HARD_STOP_TOOL_THRESHOLD,
@@ -17,9 +19,11 @@ from codex_shim.server import (
     ResponsesStreamState,
     ShimServer,
     _add_claude_execution_guidance,
+    _await_with_sse_heartbeats,
     _check_and_strip_platform_prefix,
     _claude_current_turn_failed_patch_count,
     _claude_current_turn_tool_call_count,
+    _claude_current_turn_repeated_tool_call,
     _configured_claude_gateway_model,
     _custom_tool_input,
     _current_managed_model,
@@ -89,6 +93,38 @@ def test_sanitize_chatgpt_passthrough_body_drops_shim_reasoning():
     assert [item["id"] for item in sanitized["input"] if item.get("type") == "reasoning"] == ["rs_openai"]
     assert sanitized["input"][1]["encrypted_content"] == "openai-verifiable-content"
     assert len(body["input"]) == 3
+
+
+def test_sanitize_chatgpt_passthrough_body_repairs_item_id_prefixes():
+    body = {
+        "input": [
+            {
+                "id": "fc_bad_message",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello"}],
+            },
+            {
+                "id": "msg_bad_tool",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "exec_command",
+                "arguments": "{}",
+            },
+            {
+                "id": "msg_keep",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue"}],
+            },
+        ]
+    }
+
+    sanitized = _sanitize_chatgpt_passthrough_body(body)
+
+    assert sanitized["input"][0]["id"] == "msg_bad_message"
+    assert sanitized["input"][1]["id"] == "fc_bad_tool"
+    assert sanitized["input"][2]["id"] == "msg_keep"
 
 
 def test_configured_claude_gateway_model_prefers_env(monkeypatch):
@@ -270,6 +306,67 @@ def test_claude_execution_guidance_adds_loop_breaker_after_threshold():
     assert CLAUDE_EXECUTION_RULES in guidance["content"]
     assert "Claude tool-loop breaker" in guidance["content"]
     assert f"used {CLAUDE_LOOP_BREAK_TOOL_THRESHOLD} tool calls" in guidance["content"]
+
+
+def test_claude_repeated_tool_call_hard_stops_exact_command_loop():
+    repeated_call = {
+        "type": "function_call",
+        "name": "exec_command",
+        "arguments": json.dumps({"cmd": "curl -s example.test | grep agd"}),
+    }
+    body = {
+        "input": [
+            {"type": "message", "role": "user", "content": "investigate"},
+            *[dict(repeated_call) for _ in range(CLAUDE_REPEAT_TOOL_CALL_THRESHOLD)],
+        ]
+    }
+    chat_body = {
+        "messages": [{"role": "user", "content": "investigate"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "exec_command", "parameters": {}},
+            }
+        ],
+    }
+
+    assert _claude_current_turn_repeated_tool_call(body) == (
+        "exec_command",
+        CLAUDE_REPEAT_TOOL_CALL_THRESHOLD,
+    )
+
+    _add_claude_execution_guidance(chat_body, body)
+
+    assert chat_body["tools"] == []
+    assert "Claude repeated-tool hard stop" in chat_body["messages"][0]["content"]
+    assert "Tools are disabled" in chat_body["messages"][0]["content"]
+
+
+def test_claude_repeated_tool_call_ignores_old_turns_and_write_stdin_polling():
+    body = {
+        "input": [
+            {"type": "message", "role": "user", "content": "old task"},
+            *[
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"pwd"}',
+                }
+                for _ in range(5)
+            ],
+            {"type": "message", "role": "user", "content": "new task"},
+            *[
+                {
+                    "type": "function_call",
+                    "name": "write_stdin",
+                    "arguments": '{"session_id":1,"chars":""}',
+                }
+                for _ in range(5)
+            ],
+        ]
+    }
+
+    assert _claude_current_turn_repeated_tool_call(body) == ("", 0)
 
 
 def test_deepseek_skill_discovery_guidance_added_for_general_task():
@@ -1460,6 +1557,52 @@ async def test_responses_only_explicit_chatgpt_routes_to_chatgpt(
     await shim_client.close()
 
 
+async def test_explicit_chatgpt_failure_does_not_fallback_to_claude(
+    monkeypatch,
+    tmp_path,
+    auth_present,
+):
+    class FailedResponse:
+        status = 400
+
+        async def text(self):
+            return "invalid history item id"
+
+        def release(self):
+            return None
+
+    class FakeSession:
+        async def post(self, *args, **kwargs):
+            return FailedResponse()
+
+    async def get_session(self):
+        return FakeSession()
+
+    async def claude(*args, **kwargs):
+        pytest.fail("explicit ChatGPT request must not fall back to Claude")
+
+    monkeypatch.setattr(ShimServer, "_get_session", get_session)
+    monkeypatch.setattr(ShimServer, "_claude_gateway_fallback", claude)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    client = TestClient(TestServer(ShimServer(settings).app()))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.6-sol",
+                "stream": True,
+                "input": "[chatgpt-5.6] hello",
+            },
+        )
+        text = await resp.text()
+        assert "explicit_model_failed" in text
+        assert "provider fallback is disabled" in text
+    finally:
+        await client.close()
+
+
 async def test_chatgpt_platform_survives_context_compaction(
     monkeypatch,
     tmp_path,
@@ -1983,6 +2126,57 @@ async def test_responses_stream_state_dedupes_repeated_source_tags_in_text():
     deltas = [event["delta"] for event in events if event.get("type") == "response.output_text.delta"]
     assert deltas[0] == "[claude-sonnet-4.6] 已同步。"
     assert deltas.count("[claude-sonnet-4.6] 已同步。") == 1
+
+
+async def test_responses_stream_state_blocks_tool_calls_after_claude_hard_stop():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState(
+        "claude-sonnet-4.6",
+        block_tool_calls=True,
+        blocked_tool_name="apply_patch",
+    )
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_patch",
+                                "function": {
+                                    "name": "apply_patch",
+                                    "arguments": "*** Begin Patch",
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    await state.finish(downstream)
+
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    event_types = {event.get("type") for event in events}
+    assert "response.custom_tool_call_input.done" not in event_types
+    assert "response.function_call_arguments.done" not in event_types
+    assert "response.completed" in event_types
+    text = "".join(
+        event.get("delta", "")
+        for event in events
+        if event.get("type") == "response.output_text.delta"
+    )
+    assert "Stopped a repeated Claude tool loop" in text
+    assert "apply_patch" in text
 
 
 def test_sanitize_bedrock_messages_drops_trailing_assistant_after_merge():
@@ -3151,3 +3345,93 @@ async def test_switch_model_requires_slug(tmp_path, auth_missing):
         assert resp.status == 400
     finally:
         await shim_client.close()
+
+
+@pytest.mark.asyncio
+async def test_await_with_sse_heartbeats_keeps_slow_stream_read_alive():
+    class Response:
+        def __init__(self):
+            self.writes = []
+
+        async def write(self, data):
+            self.writes.append(data)
+
+    async def slow_event():
+        import asyncio
+
+        await asyncio.sleep(0.04)
+        return 'data: {"type":"response.created"}'
+
+    response = Response()
+    result = await _await_with_sse_heartbeats(
+        slow_event(),
+        response,
+        timeout=0.2,
+        interval=0.01,
+    )
+
+    assert result == 'data: {"type":"response.created"}'
+    assert response.writes
+    assert all(write == b": codex-shim keep-alive\n\n" for write in response.writes)
+
+
+def test_chatgpt_terminal_guard_synthesizes_completed_on_early_eof():
+    guard = ChatGPTPassthroughTerminalGuard("gpt-5.6-sol", "[chatgpt-5.6]")
+    guard.observe(
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1,
+                "status": "in_progress",
+                "model": "gpt-5.6-sol",
+                "output": [],
+            },
+        }
+    )
+    guard.observe(
+        {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "partial answer",
+        }
+    )
+
+    completed = guard.synthetic_completed()
+
+    assert completed["type"] == "response.completed"
+    assert completed["response"]["status"] == "completed"
+    text = completed["response"]["output"][0]["content"][0]["text"]
+    assert text.startswith("[chatgpt-5.6]")
+    assert "partial answer" in text
+    assert "未自动重试" in text
+    assert completed["response"]["usage"]["output_tokens_details"]["reasoning_tokens"] == 0
+
+
+def test_chatgpt_terminal_guard_preserves_completed_function_call():
+    guard = ChatGPTPassthroughTerminalGuard("gpt-5.6-sol", "[chatgpt-5.6]")
+    guard.observe(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_test",
+                "type": "function_call",
+                "status": "completed",
+                "name": "exec_command",
+                "call_id": "call_test",
+                "arguments": '{"cmd":"pwd"}',
+            },
+        }
+    )
+
+    completed = guard.synthetic_completed()
+    output = completed["response"]["output"]
+
+    assert any(item.get("type") == "function_call" for item in output)
+    assert not any(
+        item.get("type") == "message"
+        and "提前结束" in item.get("content", [{}])[0].get("text", "")
+        for item in output
+    )

@@ -161,6 +161,7 @@ CLAUDE_EXECUTION_RULES = """Claude Codex execution contract:
 CLAUDE_LOOP_BREAK_TOOL_THRESHOLD = 8
 CLAUDE_SCOPE_LOCK_TOOL_THRESHOLD = 12
 CLAUDE_FORCE_FINISH_TOOL_THRESHOLD = 20
+CLAUDE_REPEAT_TOOL_CALL_THRESHOLD = 3
 CLAUDE_LOOP_BREAK_RULES = """Claude tool-loop breaker:
 - This turn has already used {tool_count} tool calls.
 - Stop broad exploration and do not reread ranges already inspected.
@@ -179,6 +180,11 @@ CLAUDE_FORCE_FINISH_RULES = """Claude finish-now mode:
 - Choose exactly one of these actions now: (1) make one final minimal edit, or (2) run one final targeted verification, or (3) report the concrete blocker.
 - Do not inspect additional files, do not expand the plan, and do not continue iterating after that single action.
 - End the turn with a concise final answer that states changed files or the blocker."""
+CLAUDE_REPEAT_TOOL_RULES = """Claude repeated-tool hard stop:
+- The exact `{tool_name}` call has already been attempted {repeat_count} times in this turn.
+- Repeating the same call cannot produce new evidence. Tools are disabled for this response.
+- Give the best conclusion from existing results now, or state the exact blocker and the one manual action needed.
+- Do not claim success when the repeated command returned no usable result."""
 
 MODEL_TOKEN_PRICING_USD_PER_MILLION: dict[str, dict[str, float | str]] = {
     "us.anthropic.claude-opus-4-6-v1": {
@@ -316,6 +322,57 @@ def _claude_current_turn_tool_call_count(body: dict[str, Any]) -> int:
     )
 
 
+def _claude_current_turn_repeated_tool_call(
+    body: dict[str, Any],
+) -> tuple[str, int]:
+    inputs = body.get("input")
+    if not isinstance(inputs, list):
+        return "", 0
+
+    latest_user_index = -1
+    for index, item in enumerate(inputs):
+        if (
+            isinstance(item, dict)
+            and item.get("role") == "user"
+            and item.get("type") in {None, "message"}
+        ):
+            latest_user_index = index
+
+    counts: dict[tuple[str, str], int] = {}
+    for item in inputs[latest_user_index + 1 :]:
+        if not isinstance(item, dict) or item.get("type") not in {
+            "function_call",
+            "custom_tool_call",
+            "computer_call",
+        }:
+            continue
+        name = str(item.get("name") or item.get("action") or "").strip()
+        if not name or name == "write_stdin":
+            continue
+        arguments = item.get("arguments", item.get("input", item.get("action")))
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                pass
+        try:
+            normalized = json.dumps(
+                arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            normalized = str(arguments)
+        key = (name, normalized)
+        counts[key] = counts.get(key, 0) + 1
+
+    if not counts:
+        return "", 0
+    (name, _), count = max(counts.items(), key=lambda entry: entry[1])
+    return name, count
+
+
 def _kimi_current_turn_tool_call_count(body: dict[str, Any]) -> int:
     """Count tool calls after the latest real user message in this turn."""
     inputs = body.get("input")
@@ -402,6 +459,13 @@ def _add_claude_execution_guidance(
     responses_body: dict[str, Any],
 ) -> int:
     tool_count, failed_patch_count, guidance = _claude_execution_guidance_state(responses_body)
+    repeated_tool, repeat_count = _claude_current_turn_repeated_tool_call(responses_body)
+    if repeat_count >= CLAUDE_REPEAT_TOOL_CALL_THRESHOLD:
+        guidance += "\n\n" + CLAUDE_REPEAT_TOOL_RULES.format(
+            tool_name=repeated_tool,
+            repeat_count=repeat_count,
+        )
+        chat_body["tools"] = []
     if failed_patch_count >= 2:
         tools = chat_body.get("tools")
         if isinstance(tools, list):
@@ -519,6 +583,13 @@ def _add_claude_execution_guidance_anthropic(
     responses_body: dict[str, Any],
 ) -> int:
     tool_count, failed_patch_count, guidance = _claude_execution_guidance_state(responses_body)
+    repeated_tool, repeat_count = _claude_current_turn_repeated_tool_call(responses_body)
+    if repeat_count >= CLAUDE_REPEAT_TOOL_CALL_THRESHOLD:
+        guidance += "\n\n" + CLAUDE_REPEAT_TOOL_RULES.format(
+            tool_name=repeated_tool,
+            repeat_count=repeat_count,
+        )
+        anthropic_body["tools"] = []
     if failed_patch_count >= 2:
         tools = anthropic_body.get("tools")
         if isinstance(tools, list):
@@ -1878,10 +1949,27 @@ class ShimServer:
         from aiohttp import ClientConnectorError, ServerDisconnectedError, ClientOSError
         import os
         FALLBACK_TIMEOUT = int(os.environ.get("CODEX_SHIM_FALLBACK_TIMEOUT", "60"))
+        STREAM_EVENT_TIMEOUT = int(
+            os.environ.get("CODEX_SHIM_STREAM_EVENT_TIMEOUT", "300")
+        )
         session = await self._get_session()
         response = _sse_response()
         await response.prepare(request)
         await _safe_write(response, b": codex-shim connected\n\n")
+
+        async def fail_explicit_model(message: str) -> web.StreamResponse:
+            payload = json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": message,
+                        "type": "explicit_model_failed",
+                    },
+                }
+            )
+            await _safe_write(response, f"data: {payload}\n\n".encode("utf-8"))
+            await response.write_eof()
+            return response
 
         # Honor an explicitly selected ChatGPT model first. The configured
         # default remains a capacity fallback for compatible requests.
@@ -1909,7 +1997,7 @@ class ShimServer:
                     upstream = await _await_with_sse_heartbeats(
                         session.post(url, json=forwarded, headers=headers),
                         response,
-                        timeout=FALLBACK_TIMEOUT,
+                        timeout=STREAM_EVENT_TIMEOUT,
                     )
                 except _asyncio.TimeoutError:
                     elapsed = time.time() - t0
@@ -1992,6 +2080,10 @@ class ShimServer:
             timed_out = True
 
         if timed_out:
+            if upstream_model is not None:
+                return await fail_explicit_model(
+                    f"Explicit ChatGPT model {original_client_model} failed; provider fallback is disabled"
+                )
             claude_result = await self._claude_gateway_fallback(
                 request,
                 body,
@@ -2052,7 +2144,11 @@ class ShimServer:
             # Buffer up to 30 events (covers metadata + error/first-content)
             for _ in range(30):
                 try:
-                    line = await _asyncio.wait_for(anext(lines_iter, _sentinel), timeout=15)  # type: ignore[arg-type]
+                    line = await _await_with_sse_heartbeats(
+                        anext(lines_iter, _sentinel),  # type: ignore[arg-type]
+                        response,
+                        timeout=FALLBACK_TIMEOUT,
+                    )
                 except _asyncio.TimeoutError:
                     break
                 if line is _sentinel:
@@ -2101,7 +2197,11 @@ class ShimServer:
                         lines_iter = _sse_lines(upstream)
                         for _ in range(30):
                             try:
-                                line = await _asyncio.wait_for(anext(lines_iter, _sentinel), timeout=15)  # type: ignore[arg-type]
+                                line = await _await_with_sse_heartbeats(
+                                    anext(lines_iter, _sentinel),  # type: ignore[arg-type]
+                                    response,
+                                    timeout=STREAM_EVENT_TIMEOUT,
+                                )
                             except _asyncio.TimeoutError:
                                 break
                             if line is _sentinel:
@@ -2127,6 +2227,10 @@ class ShimServer:
                         stream_error_detected = True
 
                 if stream_error_detected:
+                    if upstream_model is not None:
+                        return await fail_explicit_model(
+                            f"Explicit ChatGPT model {original_client_model} failed in stream; provider fallback is disabled"
+                        )
                     # All models failed, try Claude gateway
                     claude_result = await self._claude_gateway_fallback(
                         request,
@@ -2144,58 +2248,79 @@ class ShimServer:
                         prepared_response=response,
                     )
 
-            # No error — prepare response and flush buffered lines
+            # No error — prepare response and flush buffered lines. Guard the
+            # downstream protocol: Codex retries a whole turn when an upstream
+            # SSE stream closes without response.completed.
             _source_injected = False
-            # Determine source tag from the actual upstream ChatGPT model.
             _source_tag = _chatgpt_source_tag(try_model)
+            terminal_guard = ChatGPTPassthroughTerminalGuard(
+                response_model_override or try_model,
+                _source_tag,
+            )
+            saw_done = False
+
+            async def _forward_chatgpt_payload(payload: dict[str, Any]) -> None:
+                nonlocal _source_injected
+                if payload.get("type") == "response.output_text.delta" and isinstance(payload.get("delta"), str):
+                    payload = dict(payload)
+                    payload["delta"] = _strip_leading_source_tags(payload["delta"])
+                if payload.get("type") == "response.completed":
+                    response_obj = payload.get("response")
+                    if isinstance(response_obj, dict):
+                        normalized_usage = normalize_responses_usage(response_obj.get("usage"))
+                        if normalized_usage is not None:
+                            payload = dict(payload)
+                            patched_response = dict(response_obj)
+                            patched_response["usage"] = normalized_usage
+                            payload["response"] = patched_response
+                payload = _ensure_source_tag_on_response_completed(payload, _source_tag)
+                if not _source_injected and payload.get("type") == "response.output_text.delta":
+                    _source_injected = True
+                    source_evt = dict(payload)
+                    source_evt["delta"] = f"{_source_tag} "
+                    await _write_sse(response, source_evt)
+                _rewrite_response_model(payload, response_model_override)
+                terminal_guard.observe(payload)
+                await _write_sse(response, payload)
+
+            async def _finish_chatgpt_stream_if_needed() -> None:
+                nonlocal saw_done
+                if not terminal_guard.saw_completed:
+                    print(
+                        f"[shim] ChatGPT stream ended without response.completed; "
+                        f"synthesizing terminal event model={try_model}",
+                        flush=True,
+                    )
+                    await _write_sse(response, terminal_guard.synthetic_completed())
+                if not saw_done:
+                    await _safe_write(response, b"data: [DONE]\n\n")
+                    saw_done = True
+
             try:
+                stop_stream = False
                 for line in buffered_lines:
                     if line == "[DONE]":
-                        await _safe_write(response, b"data: [DONE]\n\n")
+                        stop_stream = True
                         break
                     try:
                         payload = json.loads(line)
                     except json.JSONDecodeError:
                         await _safe_write(response, f"data: {line}\n\n".encode())
                         continue
-                    if payload.get("type") == "response.output_text.delta" and isinstance(payload.get("delta"), str):
-                        payload = dict(payload)
-                        payload["delta"] = _strip_leading_source_tags(payload["delta"])
-                    payload = _ensure_source_tag_on_response_completed(payload, _source_tag)
-                    # Inject source tag before first content delta
-                    if not _source_injected and payload.get("type") == "response.output_text.delta":
-                        _source_injected = True
-                        source_evt = dict(payload)
-                        source_evt["delta"] = f"{_source_tag} "
-                        await _write_sse(response, source_evt)
-                    _rewrite_response_model(payload, response_model_override)
-                    await _write_sse(response, payload)
-                else:
-                    # Continue streaming remaining lines
+                    await _forward_chatgpt_payload(payload)
+                if not stop_stream:
                     async for line in lines_iter:
                         if line == "[DONE]":
-                            await _safe_write(response, b"data: [DONE]\n\n")
                             break
                         if _stream_has_error(line):
-                            # Late error — can't fallback now, just log
                             print(f"[shim] ⚠️  late in-stream error (already streaming): {line[:150]}", flush=True)
                         try:
                             payload = json.loads(line)
                         except json.JSONDecodeError:
                             await _safe_write(response, f"data: {line}\n\n".encode())
                             continue
-                        if payload.get("type") == "response.output_text.delta" and isinstance(payload.get("delta"), str):
-                            payload = dict(payload)
-                            payload["delta"] = _strip_leading_source_tags(payload["delta"])
-                        payload = _ensure_source_tag_on_response_completed(payload, _source_tag)
-                        # Inject source tag before first content delta
-                        if not _source_injected and payload.get("type") == "response.output_text.delta":
-                            _source_injected = True
-                            source_evt = dict(payload)
-                            source_evt["delta"] = f"{_source_tag} "
-                            await _write_sse(response, source_evt)
-                        _rewrite_response_model(payload, response_model_override)
-                        await _write_sse(response, payload)
+                        await _forward_chatgpt_payload(payload)
+                await _finish_chatgpt_stream_if_needed()
             except ClientDisconnected:
                 pass
             finally:
@@ -2277,10 +2402,24 @@ class ShimServer:
             try:
                 if first_chunk:
                     await _safe_write(response, first_chunk)
-                async for chunk in upstream.content.iter_chunked(4096):
+                chunks_iter = upstream.content.iter_chunked(4096).__aiter__()
+                while True:
+                    chunk = await _await_with_sse_heartbeats(
+                        anext(chunks_iter, _sentinel),
+                        response,
+                        timeout=STREAM_EVENT_TIMEOUT,
+                    )
+                    if chunk is _sentinel:
+                        break
                     await _safe_write(response, chunk)
             except ClientDisconnected:
                 pass
+            except _asyncio.TimeoutError:
+                print(
+                    f"[shim] ChatGPT stream idle timeout after "
+                    f"{STREAM_EVENT_TIMEOUT}s model={try_model}",
+                    flush=True,
+                )
             finally:
                 upstream.release()
 
@@ -4239,6 +4378,13 @@ class ShimServer:
 
         chat_body = responses_to_chat(body, claude_model)
         claude_tool_count = _add_claude_execution_guidance(chat_body, body)
+        repeated_tool, repeated_count = _claude_current_turn_repeated_tool_call(body)
+        if repeated_count >= CLAUDE_REPEAT_TOOL_CALL_THRESHOLD:
+            print(
+                "[shim] Claude repeated-tool hard stop "
+                f"tool={repeated_tool} repeats={repeated_count}",
+                flush=True,
+            )
         repair_stats = _repair_claude_tool_rounds(chat_body)
         if any(repair_stats.values()):
             print(
@@ -4266,7 +4412,9 @@ class ShimServer:
         session = await self._get_session()
         response = prepared_response or _sse_response()
         model_name = claude_model or response_model_override or _configured_claude_gateway_model()
-        tool_types = _build_tool_types(body)
+        repeated_tool, repeated_count = _claude_current_turn_repeated_tool_call(body)
+        repeated_tool_hard_stop = repeated_count >= CLAUDE_REPEAT_TOOL_CALL_THRESHOLD
+        tool_types = {} if repeated_tool_hard_stop else _build_tool_types(body)
         state = ResponsesStreamState(
             model_name,
             tool_types,
@@ -4278,6 +4426,8 @@ class ShimServer:
                 charge_key=charge_key,
             ) or usage,
             source_tag=_claude_source_tag(model_name),
+            block_tool_calls=repeated_tool_hard_stop,
+            blocked_tool_name=repeated_tool,
         )
         state_started = False
         if prepared_response is None and request is not None:
@@ -6927,19 +7077,24 @@ def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
                 output.append(sanitized)
         return output
     if isinstance(value, dict):
-        # ChatGPT Responses API requires all item IDs to start with "fc" prefix
-        # (fc_<hash>).  Codex/Claude sessions may carry IDs from other providers
-        # (e.g. tooluse_...) which cause a 400 "Invalid 'input[N].id'" error.
+        # ChatGPT Responses API requires message IDs to start with "msg_" and
+        # tool-call IDs to start with "fc_". Mixed-provider Hermes histories
+        # may contain the opposite prefix after a Claude/Kimi turn.
         if "id" in value and isinstance(value.get("id"), str):
             _item_id = value["id"]
             _item_type = str(value.get("type") or "")
-            if _item_id.startswith("tooluse_"):
+            _item_role = str(value.get("role") or "")
+            _is_message = _item_type == "message" or (
+                not _item_type and _item_role in {"user", "assistant", "system"}
+            )
+            if _is_message and not _item_id.startswith("msg_"):
+                suffix = _item_id[3:] if _item_id.startswith("fc_") else _item_id
+                value["id"] = "msg_" + suffix
+            elif not _is_message and _item_id.startswith("tooluse_"):
                 value["id"] = "fc_" + _item_id
-            elif _item_id.startswith("msg_"):
-                # message items: ChatGPT allows msg_ prefix but strips it to fc_
-                # to guarantee compatibility regardless of upstream naming.
+            elif not _is_message and _item_id.startswith("msg_"):
                 value["id"] = "fc_" + _item_id[4:]
-            elif not _item_id.startswith("fc_") and _item_type in {
+            elif not _is_message and not _item_id.startswith("fc_") and _item_type in {
                 "function_call", "function_call_output",
                 "computer_call", "computer_call_output",
                 "custom_tool_call", "custom_tool_call_output",
@@ -7063,6 +7218,105 @@ def _ensure_source_tag_on_response_completed(payload: dict[str, Any], source_tag
     patched_response["output"] = patched_output
     patched_payload["response"] = patched_response
     return patched_payload
+
+
+class ChatGPTPassthroughTerminalGuard:
+    """Reconcile passthrough SSE streams that end without response.completed.
+
+    Codex treats a closed stream without a terminal Responses event as a
+    transport failure and automatically replays the whole request. Some
+    ChatGPT web streams occasionally emit [DONE] or EOF before
+    response.completed. Preserve completed output items and synthesize one
+    terminal event so a transient upstream disconnect cannot become a retry
+    storm.
+    """
+
+    def __init__(self, model: str, source_tag: str | None = None):
+        self.model = model
+        self.source_tag = source_tag
+        self.response_template: dict[str, Any] | None = None
+        self.done_items: dict[int, dict[str, Any]] = {}
+        self.text_deltas: dict[int, list[str]] = {}
+        self.usage: dict[str, Any] | None = None
+        self.saw_completed = False
+
+    def observe(self, payload: dict[str, Any]) -> None:
+        event_type = payload.get("type")
+        response_obj = payload.get("response")
+        if isinstance(response_obj, dict):
+            if event_type in {"response.created", "response.in_progress"}:
+                self.response_template = dict(response_obj)
+            normalized_usage = normalize_responses_usage(response_obj.get("usage"))
+            if normalized_usage is not None:
+                self.usage = normalized_usage
+        if event_type == "response.completed":
+            self.saw_completed = True
+            return
+        if event_type == "response.output_item.done":
+            item = payload.get("item")
+            index = payload.get("output_index")
+            if isinstance(item, dict) and isinstance(index, int):
+                self.done_items[index] = dict(item)
+            return
+        if event_type == "response.output_text.delta":
+            delta = payload.get("delta")
+            index = payload.get("output_index")
+            if isinstance(delta, str) and isinstance(index, int):
+                self.text_deltas.setdefault(index, []).append(delta)
+            return
+        if event_type == "response.output_text.done":
+            text = payload.get("text")
+            index = payload.get("output_index")
+            if isinstance(text, str) and isinstance(index, int):
+                self.text_deltas[index] = [text]
+
+    def synthetic_completed(self) -> dict[str, Any]:
+        response_obj = dict(self.response_template or {})
+        response_obj.setdefault("id", f"resp_shim_{uuid.uuid4().hex[:24]}")
+        response_obj.setdefault("object", "response")
+        response_obj.setdefault("created_at", int(time.time()))
+        response_obj["status"] = "completed"
+        response_obj["error"] = None
+        response_obj["incomplete_details"] = None
+        response_obj["model"] = self.model
+
+        output = [self.done_items[index] for index in sorted(self.done_items)]
+        has_assistant_message = any(
+            item.get("type") == "message" and item.get("role") == "assistant"
+            for item in output
+        )
+        has_function_call = any(
+            item.get("type") in {"function_call", "local_shell_call", "custom_tool_call"}
+            for item in output
+        )
+        if not has_assistant_message and not has_function_call:
+            partial_text = "".join(
+                "".join(self.text_deltas[index])
+                for index in sorted(self.text_deltas)
+            ).strip()
+            interruption = "上游流提前结束；已停止本轮，未自动重试。"
+            text = f"{partial_text}\n\n{interruption}" if partial_text else interruption
+            output.append(
+                {
+                    "id": f"msg_shim_{uuid.uuid4().hex[:24]}",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": text,
+                            "annotations": [],
+                        }
+                    ],
+                }
+            )
+        response_obj["output"] = output
+        response_obj["usage"] = self.usage or normalize_responses_usage(
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        )
+        payload = {"type": "response.completed", "response": response_obj}
+        return _ensure_source_tag_on_response_completed(payload, self.source_tag)
 
 
 class AnthropicMessagesStreamState:
@@ -7310,6 +7564,8 @@ class ResponsesStreamState:
         tool_types: dict[str, str] | None = None,
         usage_finalizer: Any = None,
         source_tag: str | None = None,
+        block_tool_calls: bool = False,
+        blocked_tool_name: str = "",
     ):
         self.response_id = f"resp_{int(time.time() * 1000)}"
         self.message_item_id = f"msg_{int(time.time() * 1000)}"
@@ -7330,6 +7586,9 @@ class ResponsesStreamState:
         self._usage_finalized = False
         self.source_tag = source_tag
         self._source_tag_injected = False
+        self.block_tool_calls = block_tool_calls
+        self.blocked_tool_name = blocked_tool_name
+        self._blocked_tool_notice_emitted = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -7417,7 +7676,20 @@ class ResponsesStreamState:
                 if not state.get("closed"):
                     await self._close_reasoning(response, state)
             await self._text_delta(response, content)
-        for call in delta.get("tool_calls") or []:
+        tool_calls = delta.get("tool_calls") or []
+        if tool_calls and self.block_tool_calls:
+            if not self._blocked_tool_notice_emitted:
+                self._blocked_tool_notice_emitted = True
+                tool_name = self.blocked_tool_name or "the same tool"
+                await self._text_delta(
+                    response,
+                    "\n\nStopped a repeated Claude tool loop: "
+                    f"`{tool_name}` had already been attempted multiple times "
+                    "with the same input. No additional tool call was executed. "
+                    "Use the existing results or report the blocker instead.",
+                )
+            return
+        for call in tool_calls:
             await self._chat_tool_delta(response, call)
 
     async def _chat_reasoning_delta(self, response: web.StreamResponse, text: str) -> None:
